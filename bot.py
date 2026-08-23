@@ -150,11 +150,66 @@ TEXTE_ECHEC = (
     "- *Les missions constituent l'un des principaux moyens de progresser au sein de Valerius.*"
 )
 
+# ================= HIÉRARCHIE : PROPRIÉTAIRE(S) & SUPER MODO(S) =================
+# PROPRIÉTAIRE :
+#   - Rang le plus élevé, global (tous les serveurs).
+#   - Seul rang à recevoir l'intégralité des logs, toujours en message privé.
+#   - Littéralement accès à tout ce que le bot peut faire, partout, y compris
+#     le contournement du verrouillage par code.
+#   - MAVIE7620 (PROPRIETAIRE_ID) est propriétaire par défaut et ne peut pas
+#     être retiré. D'autres comptes peuvent être promus/rétrogradés par un
+#     propriétaire existant via /ajouter_proprietaire et /retirer_proprietaire.
+#
+# SUPER MODO :
+#   - Nommé par un propriétaire via /nommer_supermodo.
+#   - Pouvoir de "staff" identique à un instructeur/admin, mais UNIQUEMENT
+#     sur le serveur où il a été nommé — aucun accès ni aucun log sur les
+#     autres serveurs.
+PROPRIETAIRES_FILE = "valerius_proprietaires.json"
+SUPERMODOS_FILE = "valerius_supermodos.json"
+
+def charger_proprietaires():
+    """Retourne l'ensemble des ID Discord ayant le rang Propriétaire.
+    Le propriétaire historique (PROPRIETAIRE_ID) est toujours inclus."""
+    proprietaires = {PROPRIETAIRE_ID}
+    try:
+        with open(PROPRIETAIRES_FILE, "r", encoding="utf-8") as f:
+            proprietaires |= {int(x) for x in json.load(f).get("ids", [])}
+    except Exception:
+        pass
+    return proprietaires
+
+def sauvegarder_proprietaires(proprietaires):
+    with open(PROPRIETAIRES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"ids": [i for i in proprietaires if i != PROPRIETAIRE_ID]}, f, ensure_ascii=False)
+
+def est_proprietaire(user_id):
+    return int(user_id) in charger_proprietaires()
+
+def charger_supermodos():
+    """dict {str(user_id): guild_id} — un Super Modo n'est valable que sur CE serveur."""
+    try:
+        with open(SUPERMODOS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def sauvegarder_supermodos(supermodos):
+    with open(SUPERMODOS_FILE, "w", encoding="utf-8") as f:
+        json.dump(supermodos, f, ensure_ascii=False)
+
+def est_super_modo(user_id, guild_id):
+    if guild_id is None:
+        return False
+    return charger_supermodos().get(str(user_id)) == guild_id
+
 class VueVerrouillable(discord.ui.View):
     """Vue de base : bloque automatiquement TOUS les boutons (pas seulement
     les commandes slash) tant que le serveur n'a pas saisi le bon code
     d'activation via /deverrouiller."""
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if est_proprietaire(interaction.user.id):
+            return True
         if interaction.guild is not None and guilde_verrouillee(interaction.guild):
             try:
                 await interaction.response.send_message(MESSAGE_VERROU, ephemeral=True)
@@ -164,26 +219,41 @@ class VueVerrouillable(discord.ui.View):
         return True
 
 def verifier_permissions_staff(user):
+    # Propriétaire : accès total, sur tous les serveurs, sans exception.
+    if est_proprietaire(user.id):
+        return True
+    # Super Modo : mêmes droits que le staff, mais UNIQUEMENT sur le serveur
+    # où il a été nommé (voir /nommer_supermodo).
+    guild = getattr(user, "guild", None)
+    if guild is not None and est_super_modo(user.id, guild.id):
+        return True
+    if not hasattr(user, "roles"):
+        return False
     roles_noms = [r.name for r in user.roles]
     return user.guild_permissions.administrator or "[ [ 𝔦𝔫𝔰𝔱𝔯𝔲𝔠𝔱𝔢𝔲𝔯 ] ]" in roles_noms or "[ Palais Royal ]" in roles_noms or "Palais Royal" in roles_noms or any(r.permissions.manage_channels or r.permissions.administrator for r in user.roles)
 
 async def envoyer_log_proprietaire(bot_instance, texte_log, view=None, guild_target=None, joueur_id_target=None):
-    membre = bot_instance.get_user(PROPRIETAIRE_ID)
-    if not membre:
-        try:
-            membre = await bot_instance.fetch_user(PROPRIETAIRE_ID)
-        except Exception:
-            pass
-            
-    if membre:
-        try:
-            v = view(guild_target, joueur_id_target) if (view and guild_target and joueur_id_target) else view
-            await membre.send(f"📋 **[LOG GLOBAL ABSOLU - VALERIUS]** : {texte_log}", view=v)
-            return
-        except Exception as e:
-            pass
-            
-    print(f"[LOG GLOBAL ABSOLU CONSOLE] {texte_log}")
+    """Envoie le log complet en message privé à TOUS les comptes Propriétaires,
+    et seulement à eux — c'est le seul rang à recevoir l'intégralité des logs."""
+    au_moins_un_envoye = False
+    for owner_id in charger_proprietaires():
+        membre = bot_instance.get_user(owner_id)
+        if not membre:
+            try:
+                membre = await bot_instance.fetch_user(owner_id)
+            except Exception:
+                membre = None
+
+        if membre:
+            try:
+                v = view(guild_target, joueur_id_target) if (view and guild_target and joueur_id_target) else view
+                await membre.send(f"📋 **[LOG GLOBAL ABSOLU - VALERIUS]** : {texte_log}", view=v)
+                au_moins_un_envoye = True
+            except Exception:
+                pass
+
+    if not au_moins_un_envoye:
+        print(f"[LOG GLOBAL ABSOLU CONSOLE] {texte_log}")
 
 async def envoyer_double_notification(guild, msg_ticket, msg_missions, view=None, joueur_id=None):
     salon_missions = guild.get_channel(SALON_VALIDATION_MISSION_ID) or discord.utils.get(guild.text_channels, name="validation-mission")
@@ -691,6 +761,12 @@ class VueBoutonTicket(VueVerrouillable):
             description=f"Bienvenue {joueur.mention}.\nChoisis la difficulté de l'objectif que tu souhaites accomplir aujourd'hui pour Valerius.",
             color=discord.Color.dark_red()
         )
+        embed_ticket.add_field(name="🟢 Commune", value="Objectif rapide, délai court.", inline=True)
+        embed_ticket.add_field(name="🔵 Moyenne", value="Bon équilibre effort/récompense.", inline=True)
+        embed_ticket.add_field(name="🟠 Difficile", value="Investissement conséquent.", inline=True)
+        embed_ticket.add_field(name="🔴 Royal", value="Le sommet du prestige.", inline=True)
+        embed_ticket.set_thumbnail(url=joueur.display_avatar.url)
+        embed_ticket.set_footer(text="Un seul choix possible — une fois validé, le chrono démarre immédiatement.")
         await ticket_channel.send(embed=embed_ticket, view=VueChoixDifficulte(joueur.id))
         
         asyncio.create_task(gerer_expiration_automatique(guild, ticket_channel.id, joueur.id))
@@ -733,10 +809,14 @@ class VueChoixDifficulte(VueVerrouillable):
         for child in self.children:
             child.disabled = True
 
+        emoji_cat = {"commune": "🟢", "moyenne": "🔵", "difficile": "🟠", "royal": "🔴"}.get(cat, "📜")
         embed_mission = discord.Embed(title="📜 DECRET ATTRIBUÉ ET CHRONO LANCÉ", color=discord.Color.gold())
         embed_mission.add_field(name="🎯 Objectif", value=f"*{mission_choisie['texte']}*", inline=False)
+        embed_mission.add_field(name="🏷️ Catégorie", value=f"{emoji_cat} {cat.capitalize()}", inline=True)
         embed_mission.add_field(name="⏳ Temps restant réel", value=f"<t:{timestamp_discord}:R> (soit le <t:{timestamp_discord}:f>)", inline=False)
-        
+        embed_mission.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed_mission.set_footer(text="Utilise les boutons ci-dessous pour gérer ton ordre.")
+
         await interaction.response.edit_message(view=self)
         await interaction.channel.send(content=f"{interaction.user.mention}", embed=embed_mission, view=VueGestionJoueurMission(self.joueur_id))
 
@@ -1032,6 +1112,8 @@ async def verrou_interaction_check(interaction: discord.Interaction):
     nom = interaction.command.name if interaction.command else ""
     if nom in ("deverrouiller", "changer_code"):
         return True
+    if est_proprietaire(interaction.user.id):
+        return True
     if interaction.guild is None:
         return True
     if guilde_verrouillee(interaction.guild):
@@ -1046,6 +1128,8 @@ bot.tree.interaction_check = verrou_interaction_check
 
 @bot.check
 async def verrou_commandes_prefixe(ctx):
+    if est_proprietaire(ctx.author.id):
+        return True
     if ctx.guild is None:
         return True
     if guilde_verrouillee(ctx.guild):
@@ -1080,7 +1164,7 @@ async def deverrouiller(interaction: discord.Interaction, code: str):
 @bot.tree.command(name="changer_code", description="Change le code d'activation global du bot (Admin/Propriétaire).")
 @app_commands.describe(ancien_code="Le code actuel", nouveau_code="Le nouveau code")
 async def changer_code(interaction: discord.Interaction, ancien_code: str, nouveau_code: str):
-    est_admin = interaction.user.id == PROPRIETAIRE_ID or (interaction.guild and verifier_permissions_staff(interaction.user))
+    est_admin = est_proprietaire(interaction.user.id) or (interaction.guild and verifier_permissions_staff(interaction.user))
     if not est_admin:
         return await interaction.response.send_message("⛔ Seuls les administrateurs peuvent changer le code.", ephemeral=True)
     if ancien_code != charger_code_verrou():
@@ -1091,6 +1175,91 @@ async def changer_code(interaction: discord.Interaction, ancien_code: str, nouve
     await interaction.response.send_message("✅ **Code d'activation modifié avec succès.**", ephemeral=True)
     await envoyer_log_proprietaire(bot, f"🔑 Code d'activation modifié par {interaction.user} sur **{interaction.guild.name if interaction.guild else 'MP'}**.")
 # ================= FIN SYSTEME DE VERROUILLAGE =================
+
+# ================= GESTION DES PROPRIÉTAIRES & SUPER MODOS =================
+
+@bot.tree.command(name="ajouter_proprietaire", description="[Propriétaire] Donne le rang Propriétaire (accès total, tous serveurs) à un compte.")
+@app_commands.describe(utilisateur="Le compte à promouvoir Propriétaire")
+async def ajouter_proprietaire(interaction: discord.Interaction, utilisateur: discord.User):
+    if not est_proprietaire(interaction.user.id):
+        return await interaction.response.send_message("⛔ Seul un Propriétaire peut faire ça.", ephemeral=True)
+    proprietaires = charger_proprietaires()
+    if utilisateur.id in proprietaires:
+        return await interaction.response.send_message("✅ Ce compte est déjà Propriétaire.", ephemeral=True)
+    proprietaires.add(utilisateur.id)
+    sauvegarder_proprietaires(proprietaires)
+    await interaction.response.send_message(f"👑 {utilisateur.mention} est désormais **Propriétaire** (accès total, tous serveurs, tous les logs).", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"👑 {interaction.user} ({interaction.user.id}) a nommé {utilisateur} ({utilisateur.id}) Propriétaire.")
+
+@bot.tree.command(name="retirer_proprietaire", description="[Propriétaire] Retire le rang Propriétaire à un compte.")
+@app_commands.describe(utilisateur="Le compte à rétrograder")
+async def retirer_proprietaire(interaction: discord.Interaction, utilisateur: discord.User):
+    if not est_proprietaire(interaction.user.id):
+        return await interaction.response.send_message("⛔ Seul un Propriétaire peut faire ça.", ephemeral=True)
+    if utilisateur.id == PROPRIETAIRE_ID:
+        return await interaction.response.send_message("❌ Impossible de retirer le Propriétaire historique (MAVIE7620).", ephemeral=True)
+    proprietaires = charger_proprietaires()
+    if utilisateur.id not in proprietaires:
+        return await interaction.response.send_message("❌ Ce compte n'est pas Propriétaire.", ephemeral=True)
+    proprietaires.discard(utilisateur.id)
+    sauvegarder_proprietaires(proprietaires)
+    await interaction.response.send_message(f"✅ {utilisateur.mention} n'est plus Propriétaire.", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"⚠️ {interaction.user} ({interaction.user.id}) a retiré le rang Propriétaire à {utilisateur} ({utilisateur.id}).")
+
+@bot.tree.command(name="liste_proprietaires", description="[Propriétaire] Liste tous les comptes Propriétaires du bot.")
+async def liste_proprietaires(interaction: discord.Interaction):
+    if not est_proprietaire(interaction.user.id):
+        return await interaction.response.send_message("⛔ Seul un Propriétaire peut faire ça.", ephemeral=True)
+    lignes = []
+    for pid in charger_proprietaires():
+        u = bot.get_user(pid)
+        suffixe = " *(historique)*" if pid == PROPRIETAIRE_ID else ""
+        lignes.append(f"👑 {u.mention if u else '`' + str(pid) + '`'}{suffixe}")
+    embed = discord.Embed(title="👑 Propriétaires de Valerius", description="\n".join(lignes) or "Aucun.", color=discord.Color.gold())
+    embed.set_footer(text="Accès total • Tous les serveurs • Tous les logs")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="nommer_supermodo", description="[Propriétaire] Nomme un Super Modo, valable UNIQUEMENT sur ce serveur.")
+@app_commands.describe(utilisateur="Le compte à nommer Super Modo sur ce serveur")
+async def nommer_supermodo(interaction: discord.Interaction, utilisateur: discord.Member):
+    if not est_proprietaire(interaction.user.id):
+        return await interaction.response.send_message("⛔ Seul un Propriétaire peut faire ça.", ephemeral=True)
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ Commande utilisable uniquement sur un serveur.", ephemeral=True)
+    supermodos = charger_supermodos()
+    supermodos[str(utilisateur.id)] = interaction.guild.id
+    sauvegarder_supermodos(supermodos)
+    await interaction.response.send_message(f"🛡️ {utilisateur.mention} est désormais **Super Modo**, uniquement sur **{interaction.guild.name}**.", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"🛡️ {interaction.user} a nommé {utilisateur} ({utilisateur.id}) Super Modo sur **{interaction.guild.name}** ({interaction.guild.id}).")
+
+@bot.tree.command(name="revoquer_supermodo", description="[Propriétaire] Retire le rang Super Modo à un compte.")
+@app_commands.describe(utilisateur="Le compte à révoquer")
+async def revoquer_supermodo(interaction: discord.Interaction, utilisateur: discord.User):
+    if not est_proprietaire(interaction.user.id):
+        return await interaction.response.send_message("⛔ Seul un Propriétaire peut faire ça.", ephemeral=True)
+    supermodos = charger_supermodos()
+    if str(utilisateur.id) not in supermodos:
+        return await interaction.response.send_message("❌ Ce compte n'est pas Super Modo.", ephemeral=True)
+    del supermodos[str(utilisateur.id)]
+    sauvegarder_supermodos(supermodos)
+    await interaction.response.send_message(f"✅ {utilisateur.mention} n'est plus Super Modo.", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"⚠️ {interaction.user} a retiré le rang Super Modo à {utilisateur} ({utilisateur.id}).")
+
+@bot.tree.command(name="liste_supermodos", description="[Staff] Liste les Super Modos et leur serveur assigné.")
+async def liste_supermodos(interaction: discord.Interaction):
+    if not verifier_permissions_staff(interaction.user):
+        return await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    supermodos = charger_supermodos()
+    lignes = []
+    for uid, gid in supermodos.items():
+        u = bot.get_user(int(uid))
+        g = bot.get_guild(gid)
+        lignes.append(f"🛡️ {u.mention if u else '`' + uid + '`'} — **{g.name if g else gid}**")
+    embed = discord.Embed(title="🛡️ Super Modos de Valerius", description="\n".join(lignes) or "Aucun.", color=discord.Color.blurple())
+    embed.set_footer(text="Chaque Super Modo n'agit que sur son serveur assigné")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ================= FIN GESTION DES PROPRIÉTAIRES & SUPER MODOS =================
 
 @bot.event
 async def on_ready():
@@ -1169,7 +1338,13 @@ async def on_message(message):
                 await message.channel.send(f"❌ <@{joueur_id}>, votre message n'a pas été validé comme preuve car **aucune image ni photo n'a été détectée**. Veuillez envoyer une capture d'écran ou une image valide pour que l'administration puisse l'analyser.")
 
 async def generer_panneau_aide(interaction: discord.Interaction):
-    embed = discord.Embed(title="⚖️ TABLEAU DES ORDRES DE VALERIUS ⚖️", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="⚖️ TABLEAU DES ORDRES DE VALERIUS ⚖️",
+        description="*Toutes les commandes disponibles pour toi, classées par rang.*",
+        color=discord.Color.gold()
+    )
+    if interaction.guild and interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
     citoyen_desc = (
         "⚔️ **SYSTÈME DE QUÊTES**\n"
         "Ouvre un ticket d'ordre privé dans la catégorie dédiée.\n\n"
@@ -1182,20 +1357,30 @@ async def generer_panneau_aide(interaction: discord.Interaction):
     embed.add_field(name="👥 ESPACE DES CITOYENS", value=citoyen_desc, inline=False)
     if verifier_permissions_staff(interaction.user):
         admin_desc = (
-            "🚨 **HAUT COMMANDEMENT (ADMIN / INSTRUCTEUR)**\n"
+            "🚨 **HAUT COMMANDEMENT (ADMIN / INSTRUCTEUR / SUPER MODO)**\n"
             "`/tutoadm` ↳ Manuel de l'administration.\n"
             "`/openticket @joueur` ↳ Ouvrir un ticket pour un citoyen.\n"
             "`/fermerticket` ↳ Fermer un salon de ticket.\n"
             "`/attribuer_mission` ↳ Assigner une mission auto à un joueur.\n"
             "`/export_actives` | `/import_actives` ↳ Sauvegarder/Restaurer les missions en cours.\n"
-            "`/total_backup` | `/total_restore` ↳ Sauvegarde/Restauration globale.\n"
             "`/mission_expiration` ↳ Lancer l'alerte d'inactivité (1h).\n"
             "`/missionaccepter` | `/missionrefuser` | `/missionpreuve` | `/ajouterhistorique`\n"
+            "`/liste_supermodos` ↳ Voir les Super Modos actifs sur ce serveur.\n\n"
             "📁 **BASE DE DONNÉES**\n"
             "`/listemissions` | `/addmission` | `/delmission` | `/resetmissions`\n"
             "*(Commandes texte : `!export` / `!import` / `!delall`)*"
         )
         embed.add_field(name="👑 ADMINISTRATION", value=admin_desc, inline=False)
+    if est_proprietaire(interaction.user.id):
+        proprio_desc = (
+            "👑 **RÉSERVÉ AU(X) PROPRIÉTAIRE(S) — ACCÈS TOTAL, TOUS SERVEURS**\n"
+            "`/total_backup` | `/total_restore` ↳ Sauvegarde/Restauration globale du bot.\n"
+            "`/ajouter_proprietaire` | `/retirer_proprietaire` | `/liste_proprietaires`\n"
+            "`/nommer_supermodo` | `/revoquer_supermodo` ↳ Gérer les Super Modos par serveur.\n"
+            "`/changer_code` ↳ Modifier le code d'activation global."
+        )
+        embed.add_field(name="🔑 PROPRIÉTAIRE", value=proprio_desc, inline=False)
+    embed.set_footer(text="Valerius Pro • Que la fortune te sourie", icon_url=interaction.client.user.display_avatar.url if interaction.client.user else None)
     await interaction.response.send_message(embed=embed, view=VueBoutonTicket())
 
 @bot.tree.command(name="aide", description="Affiche le tableau de bord des quêtes de Valerius.")
@@ -1343,7 +1528,9 @@ async def attribuer_mission(interaction: discord.Interaction, joueur: discord.Me
     embed_mission.add_field(name="🎯 Objectif", value=f"*{mission_choisie['texte']}*", inline=False)
     embed_mission.add_field(name="📊 Difficulté", value=f"`{cat.upper()}`", inline=True)
     embed_mission.add_field(name="⏳ Temps imparti", value=f"<t:{timestamp_discord}:R> (soit le <t:{timestamp_discord}:f>)", inline=False)
-    
+    embed_mission.set_thumbnail(url=joueur.display_avatar.url)
+    embed_mission.set_footer(text=f"Attribué par {interaction.user.display_name}")
+
     await interaction.response.send_message(content=f"✅ Mission attribuée avec succès à {joueur.mention} dans ce salon !", embed=embed_mission, view=VueGestionJoueurMission(joueur.id))
 
 @bot.tree.command(name="export_actives", description="Exporte et envoie un fichier .txt de toutes les missions actuellement en cours.")
@@ -1478,10 +1665,10 @@ def generer_backup_complet():
     nom_fichier = f"total_backup_valerius_{timestamp_sauvegarde}.json"
     return buffer, nom_fichier, len(donnees_octets)
 
-@bot.tree.command(name="total_backup", description="Exporte une archive complete de toutes les donnees du bot.")
+@bot.tree.command(name="total_backup", description="[Propriétaire] Exporte une archive complete de TOUTES les données du bot (tous serveurs).")
 async def total_backup(interaction: discord.Interaction):
-    if not verifier_permissions_staff(interaction.user):
-        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    if not est_proprietaire(interaction.user.id):
+        await interaction.response.send_message("⛔ Cette sauvegarde contient les données de tous les serveurs : réservée aux Propriétaires.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1579,11 +1766,11 @@ def restaurer_donnees_backup(donnees, channel_fallback=None):
 
     return nb_restaurees, len(fichiers_disques)
 
-@bot.tree.command(name="total_restore", description="Restaure toutes les données à partir d'un fichier de backup.")
+@bot.tree.command(name="total_restore", description="[Propriétaire] Restaure TOUTES les données du bot (tous serveurs) à partir d'un fichier de backup.")
 @app_commands.describe(fichier="Le fichier .json de sauvegarde totale")
 async def total_restore(interaction: discord.Interaction, fichier: discord.Attachment):
-    if not verifier_permissions_staff(interaction.user):
-        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    if not est_proprietaire(interaction.user.id):
+        await interaction.response.send_message("⛔ Cette restauration touche les données de tous les serveurs : réservée aux Propriétaires.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1744,9 +1931,23 @@ async def tutoadm(interaction: discord.Interaction):
     )
     embed_tuto.add_field(
         name="🛠️ 2. Commandes d'Urgence Manuelles",
-        value="`/openticket @joueur` -> Ouvrir un ticket\n`/fermerticket` -> Fermer instantanément un salon de ticket\n`/attribuer_mission` -> Assigner une mission auto\n`/ajouterhistorique @joueur [Succes/Echec] [categorie] [texte]` -> Ajouter une mission à l'historique\n`/export_actives` & `/import_actives` -> Sauvegarder/Recharger les missions en cours\n`/total_backup` & `/total_restore` -> Sauvegarder/Restaurer tout le bot\n`/missionaccepter` / `/missionrefuser` / `/missionpreuve`",
+        value="`/openticket @joueur` -> Ouvrir un ticket\n`/fermerticket` -> Fermer instantanément un salon de ticket\n`/attribuer_mission` -> Assigner une mission auto\n`/ajouterhistorique @joueur [Succes/Echec] [categorie] [texte]` -> Ajouter une mission à l'historique\n`/export_actives` & `/import_actives` -> Sauvegarder/Recharger les missions en cours (ce serveur)\n`/missionaccepter` / `/missionrefuser` / `/missionpreuve`",
         inline=False
     )
+    embed_tuto.add_field(
+        name="🛡️ 3. Ton rang sur ce serveur",
+        value=(f"🛡️ Super Modo (limité à **{interaction.guild.name}**)" if est_super_modo(interaction.user.id, interaction.guild.id) and not est_proprietaire(interaction.user.id)
+               else "👑 Propriétaire (accès total, tous serveurs)" if est_proprietaire(interaction.user.id)
+               else "🚨 Staff (rôle/permission du serveur)"),
+        inline=False
+    )
+    if est_proprietaire(interaction.user.id):
+        embed_tuto.add_field(
+            name="👑 4. Réservé aux Propriétaires",
+            value="`/total_backup` & `/total_restore` -> Sauvegarde/Restauration de **TOUS** les serveurs\n`/ajouter_proprietaire` / `/retirer_proprietaire` / `/liste_proprietaires`\n`/nommer_supermodo` / `/revoquer_supermodo` -> Un Super Modo n'agit que sur le serveur où il est nommé\n`/changer_code` -> Code d'activation global",
+            inline=False
+        )
+    embed_tuto.set_footer(text="Valerius Pro • Manuel de l'administration")
     await interaction.response.send_message(embed=embed_tuto, ephemeral=True)
 
 @bot.tree.command(name="missionaccepter", description="Valide et force manuellement le succès de la mission d'un joueur.")
