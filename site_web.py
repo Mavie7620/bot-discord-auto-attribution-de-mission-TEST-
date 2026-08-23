@@ -40,8 +40,10 @@ import os
 import json
 import secrets
 import functools
+import asyncio
 from datetime import datetime
 
+import discord
 from flask import request, redirect, url_for, session, send_file, abort, render_template_string
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -312,6 +314,8 @@ def page_html(titre, corps, connecte=None, role=None):
             liens.append('<a href="/admin/dashboard">Tableau de bord</a>')
             liens.append('<a href="/admin/logs">Logs</a>')
             liens.append('<a href="/admin/securite">Sécurité</a>')
+            liens.append('<a href="/admin/message">Message</a>')
+            liens.append('<a href="/admin/recherche-joueur">Rechercher un joueur</a>')
             liens.append('<a href="/admin/backup">Sauvegardes</a>')
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
@@ -1109,17 +1113,31 @@ def configurer_site(app, bot, deps):
                     erreur = "Le nouveau code doit faire au moins 6 caractères."
                 else:
                     deps["sauvegarder_code_verrou"](nouveau_code)
+                    deps["sauvegarder_log_disque"](f"🔑 Code d'activation changé depuis le site par {connecte()}.")
                     message = "Code d'activation mis à jour avec succès."
             elif action == "verrouiller":
                 guild_id = int(request.form.get("guild_id"))
                 deps["guildes_deverrouillees"].discard(guild_id)
+                nom_guild = next((g.name for g in bot.guilds if g.id == guild_id), guild_id)
+                deps["sauvegarder_log_disque"](f"🔒 Serveur **{nom_guild}** reverrouillé depuis le site par {connecte()}.")
                 message = "Serveur reverrouillé."
             elif action == "deverrouiller":
                 guild_id = int(request.form.get("guild_id"))
                 deps["guildes_deverrouillees"].add(guild_id)
+                nom_guild = next((g.name for g in bot.guilds if g.id == guild_id), guild_id)
+                deps["sauvegarder_log_disque"](f"🔓 Serveur **{nom_guild}** déverrouillé depuis le site par {connecte()}.")
                 message = "Serveur déverrouillé."
+            elif action == "maintenance_on":
+                deps["definir_maintenance"](True)
+                deps["sauvegarder_log_disque"](f"🛠️ Mode maintenance ACTIVÉ depuis le site par {connecte()}.")
+                message = "Mode maintenance activé : le bot ne répond plus qu'au Propriétaire."
+            elif action == "maintenance_off":
+                deps["definir_maintenance"](False)
+                deps["sauvegarder_log_disque"](f"✅ Mode maintenance DÉSACTIVÉ depuis le site par {connecte()}.")
+                message = "Mode maintenance désactivé : le bot répond de nouveau normalement."
 
         code_actuel = deps["charger_code_verrou"]()
+        maintenance_active = deps["charger_maintenance"]()
         guilds = list(bot.guilds)
         deverrouillees = deps["guildes_deverrouillees"]
         lignes_serveurs = [(g, g.id in deverrouillees) for g in guilds]
@@ -1128,6 +1146,25 @@ def configurer_site(app, bot, deps):
         <h1>Sécurité</h1>
         {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
         {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        <div class="card row" style="justify-content:space-between;">
+          <div>
+            <h2 style="margin-top:0">Mode maintenance global</h2>
+            <p class="muted">Bloque toutes les commandes sur tous les serveurs (sauf pour le Propriétaire), utile pour une mise à jour en cours.</p>
+          </div>
+          <div class="row">
+            <span class="pill {{ 'off' if maintenance_active else 'on' }}">{{ 'Maintenance active' if maintenance_active else 'Bot en service' }}</span>
+            <form method="post" class="inline">
+              {% if maintenance_active %}
+              <input type="hidden" name="action" value="maintenance_off">
+              <button type="submit">Désactiver la maintenance</button>
+              {% else %}
+              <input type="hidden" name="action" value="maintenance_on">
+              <button class="danger" type="submit" onclick="return confirm('Activer la maintenance va rendre le bot muet sur tous les serveurs. Continuer ?')">Activer la maintenance</button>
+              {% endif %}
+            </form>
+          </div>
+        </div>
 
         <div class="card">
           <h2 style="margin-top:0">Code d'activation</h2>
@@ -1158,8 +1195,123 @@ def configurer_site(app, bot, deps):
           </div>
         </div>
         {% endfor %}
-        """, message=message, erreur=erreur, code_actuel=code_actuel, lignes_serveurs=lignes_serveurs)
+        """, message=message, erreur=erreur, code_actuel=code_actuel, lignes_serveurs=lignes_serveurs,
+             maintenance_active=maintenance_active)
         return page_html("Sécurité", corps, connecte(), "proprietaire")
+
+    # ---------- Envoyer un message dans un salon (proprietaire uniquement) ----------
+
+    @app.route("/admin/message", methods=["GET", "POST"])
+    @role_required("proprietaire")
+    def admin_message():
+        message = None
+        erreur = None
+        guilds = list(bot.guilds)
+        guild_id_selectionne = request.values.get("guild_id", "")
+        salons = []
+        if guild_id_selectionne:
+            g = discord.utils.get(guilds, id=int(guild_id_selectionne))
+            if g:
+                salons = [c for c in g.text_channels if c.permissions_for(g.me).send_messages]
+
+        if request.method == "POST":
+            channel_id = request.form.get("channel_id", "")
+            texte = request.form.get("texte", "").strip()
+            if not channel_id or not texte:
+                erreur = "Choisis un salon et écris un message."
+            else:
+                channel = bot.get_channel(int(channel_id))
+                if not channel:
+                    erreur = "Salon introuvable (le bot n'a peut-être plus accès à ce salon)."
+                else:
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(channel.send(texte), bot.loop)
+                        future.result(timeout=10)
+                        deps["sauvegarder_log_disque"](f"✉️ Message envoyé depuis le site par {connecte()} dans #{channel.name} ({channel.guild.name}).")
+                        message = f"Message envoyé dans #{channel.name} !"
+                    except Exception as e:
+                        erreur = f"Erreur lors de l'envoi : {e}"
+
+        corps = render_template_string("""
+        <h1>Envoyer un message</h1>
+        <p class="muted">Envoie un message dans n'importe quel salon texte, sur n'importe quel serveur où le bot est présent.</p>
+        {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        <div class="card">
+          <form method="get" class="row">
+            <select name="guild_id" onchange="this.form.submit()">
+              <option value="">— Choisir un serveur —</option>
+              {% for g in guilds %}
+              <option value="{{ g.id }}" {% if guild_id_selectionne == g.id|string %}selected{% endif %}>{{ g.name }}</option>
+              {% endfor %}
+            </select>
+          </form>
+
+          {% if salons %}
+          <form method="post" style="margin-top:16px;">
+            <input type="hidden" name="guild_id" value="{{ guild_id_selectionne }}">
+            <p>
+              <select name="channel_id" required style="width:100%">
+                <option value="" disabled selected>Choisis un salon</option>
+                {% for c in salons %}
+                <option value="{{ c.id }}">#{{ c.name }}</option>
+                {% endfor %}
+              </select>
+            </p>
+            <p><textarea name="texte" rows="5" placeholder="Ton message..." required style="width:100%;font-family:inherit;font-size:14px;padding:12px 15px;border-radius:10px;border:1px solid var(--border);background:var(--bg-soft);color:var(--text)"></textarea></p>
+            <button type="submit">Envoyer</button>
+          </form>
+          {% elif guild_id_selectionne %}
+          <p class="muted" style="margin-top:16px;">Aucun salon accessible trouvé sur ce serveur.</p>
+          {% endif %}
+        </div>
+        """, guilds=guilds, salons=salons, guild_id_selectionne=guild_id_selectionne, message=message, erreur=erreur)
+        return page_html("Message", corps, connecte(), "proprietaire")
+
+    # ---------- Recherche d'un joueur cross-serveurs (proprietaire uniquement) ----------
+
+    @app.route("/admin/recherche-joueur", methods=["GET", "POST"])
+    @role_required("proprietaire")
+    def admin_recherche_joueur():
+        resultats = []
+        joueur_id = ""
+        if request.method == "POST":
+            joueur_id = request.form.get("joueur_id", "").strip()
+            if joueur_id:
+                for g in bot.guilds:
+                    profils = deps["charger_profils"](g.id)
+                    profil = profils.get(joueur_id)
+                    if profil:
+                        membre = g.get_member(int(joueur_id)) if joueur_id.isdigit() else None
+                        resultats.append({
+                            "guild": g, "profil": profil,
+                            "nom": membre.display_name if membre else joueur_id
+                        })
+
+        corps = render_template_string("""
+        <h1>Rechercher un joueur</h1>
+        <p class="muted">Retrouve le profil d'un joueur (son ID Discord) sur tous les serveurs où il a un historique.</p>
+        <div class="card">
+          <form method="post" class="row">
+            <input name="joueur_id" placeholder="ID Discord du joueur" value="{{ joueur_id }}" style="flex:1;min-width:220px" required>
+            <button type="submit">Rechercher</button>
+          </form>
+        </div>
+        {% if joueur_id and not resultats %}
+        <div class="card muted">Aucun profil trouvé pour cet ID sur aucun serveur.</div>
+        {% endif %}
+        {% for r in resultats %}
+        <div class="card row" style="justify-content:space-between;">
+          <div>
+            <strong>{{ r.nom }}</strong> — {{ r.guild.name }}
+            <div class="muted">{{ r.profil.total_reussies }} réussie(s) — {{ r.profil.total_echouees }} échouée(s)</div>
+          </div>
+          <a class="btnlink" href="/admin/profils/{{ r.guild.id }}/{{ joueur_id }}">Voir l'historique</a>
+        </div>
+        {% endfor %}
+        """, resultats=resultats, joueur_id=joueur_id)
+        return page_html("Rechercher un joueur", corps, connecte(), "proprietaire")
 
     # ---------- Utilisateur (recrue/membre) : son profil uniquement ----------
 

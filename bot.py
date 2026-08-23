@@ -1139,6 +1139,24 @@ MESSAGE_VERROU = (
     "Un administrateur doit utiliser : `/deverrouiller code:<le code>`"
 )
 
+MAINTENANCE_FILE = "valerius_maintenance.json"
+
+def charger_maintenance():
+    try:
+        with open(MAINTENANCE_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("actif", False))
+    except Exception:
+        return False
+
+def definir_maintenance(actif):
+    with open(MAINTENANCE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"actif": bool(actif)}, f, ensure_ascii=False)
+
+MESSAGE_MAINTENANCE = (
+    "🛠️ **VALERIUS EST EN MAINTENANCE**\n"
+    "Le bot est temporairement indisponible, réessaie un peu plus tard."
+)
+
 async def envoyer_demande_code(guild):
     salon = guild.system_channel
     if salon is None or not salon.permissions_for(guild.me).send_messages:
@@ -1155,6 +1173,12 @@ async def verrou_interaction_check(interaction: discord.Interaction):
         return True
     if est_proprietaire(interaction.user.id):
         return True
+    if charger_maintenance():
+        try:
+            await interaction.response.send_message(MESSAGE_MAINTENANCE, ephemeral=True)
+        except Exception:
+            pass
+        return False
     if interaction.guild is None:
         return True
     if guilde_verrouillee(interaction.guild):
@@ -1171,6 +1195,12 @@ bot.tree.interaction_check = verrou_interaction_check
 async def verrou_commandes_prefixe(ctx):
     if est_proprietaire(ctx.author.id):
         return True
+    if charger_maintenance():
+        try:
+            await ctx.send(MESSAGE_MAINTENANCE)
+        except Exception:
+            pass
+        return False
     if ctx.guild is None:
         return True
     if guilde_verrouillee(ctx.guild):
@@ -2126,10 +2156,13 @@ site_web.configurer_site(app, bot, {
     "generer_backup_complet": generer_backup_complet,
     "restaurer_donnees_backup": restaurer_donnees_backup,
     "charger_logs_recents": charger_logs_recents,
+    "sauvegarder_log_disque": sauvegarder_log_disque,
     "bot_start_time": BOT_START_TIME,
     "charger_code_verrou": charger_code_verrou,
     "sauvegarder_code_verrou": sauvegarder_code_verrou,
     "guildes_deverrouillees": guildes_deverrouillees,
+    "charger_maintenance": charger_maintenance,
+    "definir_maintenance": definir_maintenance,
 })
 
 keep_alive()
