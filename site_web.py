@@ -8,6 +8,26 @@ Ce module ne fait AUCUNE hypothèse sur les données du bot : toutes les
 fonctions dont il a besoin (lecture/écriture des missions, des profils,
 des backups...) lui sont injectées via configurer_site(app, bot, deps)
 pour éviter tout import circulaire avec bot.py.
+
+================= SYSTEME DE RÔLES =================
+Cinq rôles, du plus faible au plus fort :
+  recrue < membre < instructeur < admin < super_admin
+
+- N'importe qui avec le lien peut créer un compte via /inscription.
+  Le compte créé est toujours "recrue" au départ, et l'inscrit doit
+  choisir le serveur Discord auquel il appartient. Ce choix est
+  DÉFINITIF de son côté : lui seul ne peut plus le changer ensuite.
+- "instructeur" et plus : accède à /admin/serveurs, mais seulement
+  au(x) serveur(s) qui lui sont assignés (sauf super_admin : tous).
+- "admin" et plus : peut en plus gérer le catalogue de missions et
+  les comptes du site (créer/modifier/supprimer), mais seulement
+  pour son propre serveur, et seulement des comptes d'un rôle
+  strictement inférieur au sien (impossible de créer/modifier un
+  compte admin ou super_admin si on n'est pas soi-même super_admin).
+  C'est un admin (ou plus) qui peut changer le serveur assigné à
+  un compte.
+- "super_admin" (Super Modo) : accès à peu près à tout, sur tous
+  les serveurs, y compris les sauvegardes globales.
 """
 import os
 import json
@@ -21,17 +41,64 @@ COMPTES_FILE = "valerius_comptes.json"
 SECRET_KEY_FILE = "valerius_secret.key"
 COMPTE_PROPRIETAIRE_LOGIN = "MAVIE7620"
 
+ROLES_ORDRE = ["recrue", "membre", "instructeur", "admin", "super_admin"]
+ROLE_LABELS = {
+    "recrue": "Recrue",
+    "membre": "Membre",
+    "instructeur": "Instructeur",
+    "admin": "Admin",
+    "super_admin": "Super Modo",
+}
+
+
+def niveau_role(role):
+    try:
+        return ROLES_ORDRE.index(role)
+    except (ValueError, TypeError):
+        return 0
+
+
+def guild_autorise(compte, guild_id):
+    """True si ce compte a le droit de voir/gérer les données de ce serveur."""
+    if not compte:
+        return False
+    if compte.get("role") == "super_admin":
+        return True
+    return str(compte.get("guild_id")) == str(guild_id)
+
 
 # ================= GESTION DES COMPTES =================
+
+def _migrer_comptes(comptes):
+    """Migration douce de l'ancien système (rôles 'admin'/'user') vers
+    la nouvelle hiérarchie à 5 rôles, sans casser les comptes existants."""
+    modifie = False
+    for login, c in comptes.items():
+        if c.get("role") == "user":
+            c["role"] = "membre"
+            modifie = True
+        if login == COMPTE_PROPRIETAIRE_LOGIN and c.get("role") != "super_admin":
+            c["role"] = "super_admin"
+            modifie = True
+        if c.get("role") not in ROLES_ORDRE:
+            c["role"] = "recrue"
+            modifie = True
+        c.setdefault("guild_id", None)
+        c.setdefault("discord_id", None)
+    if modifie:
+        sauvegarder_comptes(comptes)
+    return comptes
+
 
 def charger_comptes():
     if not os.path.exists(COMPTES_FILE):
         return {}
     try:
         with open(COMPTES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            comptes = json.load(f)
     except Exception:
         return {}
+    return _migrer_comptes(comptes)
 
 
 def sauvegarder_comptes(comptes):
@@ -46,8 +113,7 @@ def _generer_mot_de_passe():
 async def initialiser_compte_proprietaire(envoyer_log_proprietaire, bot):
     """À appeler une fois au démarrage (dans on_ready) : crée le compte
     propriétaire MAVIE7620 s'il n'existe pas encore, avec un mot de passe
-    aléatoire envoyé en MP — jamais écrit en clair dans le code source,
-    contrairement à l'ancien code d'activation."""
+    aléatoire envoyé en MP — jamais écrit en clair dans le code source."""
     comptes = charger_comptes()
     if COMPTE_PROPRIETAIRE_LOGIN in comptes:
         return
@@ -55,7 +121,7 @@ async def initialiser_compte_proprietaire(envoyer_log_proprietaire, bot):
     mot_de_passe = _generer_mot_de_passe()
     comptes[COMPTE_PROPRIETAIRE_LOGIN] = {
         "password_hash": generate_password_hash(mot_de_passe),
-        "role": "admin",
+        "role": "super_admin",
         "discord_id": None,
         "guild_id": None,
         "must_change_password": True
@@ -99,12 +165,12 @@ STYLE = """
   nav a { color:#cfcfe0; text-decoration:none; font-size:14px; }
   nav a:hover { color:#fff; }
   nav .brand { font-weight:700; color:#e0b64d; margin-right:auto; letter-spacing:.5px; }
-  main { max-width:920px; margin:32px auto; padding:0 20px 60px; }
+  main { max-width:960px; margin:32px auto; padding:0 20px 60px; }
   h1 { font-size:22px; margin-bottom:4px; }
   h2 { font-size:17px; color:#cfcfe0; margin-top:32px; }
   .card { background:#1b1c22; border:1px solid #2a2b33; border-radius:10px; padding:18px 20px; margin:14px 0; }
   table { width:100%; border-collapse:collapse; margin-top:8px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a2b33; font-size:14px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a2b33; font-size:14px; vertical-align:middle; }
   th { color:#9a9ab0; font-weight:600; }
   input, select, button { font-family:inherit; font-size:14px; padding:9px 12px; border-radius:7px; border:1px solid #33343e; background:#101116; color:#eee; }
   button { background:#e0b64d; color:#1b1c22; border:none; font-weight:600; cursor:pointer; }
@@ -114,9 +180,12 @@ STYLE = """
   .flash { padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px; }
   .flash.erreur { background:#3a1f22; color:#ff9d9d; border:1px solid #5c2b2f; }
   .flash.ok { background:#1f3a25; color:#9dff9d; border:1px solid #2b5c32; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:12px; white-space:nowrap; }
+  .badge.recrue { background:#2a2b33; color:#9a9ab0; }
+  .badge.membre { background:#22303a; color:#7ec8e3; }
+  .badge.instructeur { background:#1f3a34; color:#5fd0b0; }
   .badge.admin { background:#3a2f1f; color:#e0b64d; }
-  .badge.user { background:#22303a; color:#7ec8e3; }
+  .badge.super_admin { background:#3a1f34; color:#e07ec8; }
   form.inline { display:inline; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   .muted { color:#8f8fa3; font-size:13px; }
@@ -128,15 +197,18 @@ STYLE = """
 def page_html(titre, corps, connecte=None, role=None):
     nav_liens = ""
     if connecte:
-        if role == "admin":
-            nav_liens = (
-                '<a href="/admin/serveurs">Serveurs</a>'
-                '<a href="/admin/comptes">Comptes</a>'
-                '<a href="/admin/backup">Sauvegardes</a>'
-            )
-        else:
-            nav_liens = '<a href="/mon-profil">Mon profil</a>'
-        nav_liens += f'<span class="muted">{connecte}</span><a href="/deconnexion">Déconnexion</a>'
+        niveau = niveau_role(role)
+        liens = []
+        if niveau >= niveau_role("instructeur"):
+            liens.append('<a href="/admin/serveurs">Serveurs</a>')
+        if niveau >= niveau_role("admin"):
+            liens.append('<a href="/admin/comptes">Comptes</a>')
+        if niveau >= niveau_role("super_admin"):
+            liens.append('<a href="/admin/backup">Sauvegardes</a>')
+        if niveau < niveau_role("instructeur"):
+            liens.append('<a href="/mon-profil">Mon profil</a>')
+        badge = f'<span class="badge {role}">{ROLE_LABELS.get(role, role)}</span>' if role else ""
+        nav_liens = "".join(liens) + f'<span class="muted">{connecte}</span>{badge}<a href="/deconnexion">Déconnexion</a>'
     return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -185,21 +257,25 @@ def configurer_site(app, bot, deps):
             return f(*a, **kw)
         return wrapper
 
-    def admin_required(f):
-        @functools.wraps(f)
-        def wrapper(*a, **kw):
-            if not connecte():
-                return redirect(url_for("connexion"))
-            compte = compte_connecte()
-            if not compte:
-                session.clear()
-                return redirect(url_for("connexion"))
-            if compte.get("must_change_password"):
-                return redirect(url_for("changer_mot_de_passe"))
-            if compte.get("role") != "admin":
-                abort(403)
-            return f(*a, **kw)
-        return wrapper
+    def role_required(min_role):
+        """Exige d'être connecté ET d'avoir au moins ce rôle dans la
+        hiérarchie recrue < membre < instructeur < admin < super_admin."""
+        def decorateur(f):
+            @functools.wraps(f)
+            def wrapper(*a, **kw):
+                if not connecte():
+                    return redirect(url_for("connexion"))
+                compte = compte_connecte()
+                if not compte:
+                    session.clear()
+                    return redirect(url_for("connexion"))
+                if compte.get("must_change_password") and request.endpoint != "changer_mot_de_passe":
+                    return redirect(url_for("changer_mot_de_passe"))
+                if niveau_role(compte.get("role")) < niveau_role(min_role):
+                    abort(403)
+                return f(*a, **kw)
+            return wrapper
+        return decorateur
 
     # ---------- Authentification ----------
 
@@ -207,10 +283,76 @@ def configurer_site(app, bot, deps):
     def racine():
         if connecte():
             compte = compte_connecte()
-            if compte and compte.get("role") == "admin":
-                return redirect(url_for("admin_serveurs"))
-            return redirect(url_for("mon_profil"))
+            if compte:
+                if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
+                    return redirect(url_for("admin_serveurs"))
+                return redirect(url_for("mon_profil"))
         return redirect(url_for("connexion"))
+
+    @app.route("/inscription", methods=["GET", "POST"])
+    def inscription():
+        erreur = None
+        if request.method == "POST":
+            login = request.form.get("login", "").strip()
+            mdp = request.form.get("mot_de_passe", "")
+            confirmation = request.form.get("confirmation", "")
+            discord_id = request.form.get("discord_id", "").strip() or None
+            guild_id = request.form.get("guild_id", "").strip()
+            comptes = charger_comptes()
+            guilds_valides = {str(g.id) for g in bot.guilds}
+            if not login:
+                erreur = "Identifiant requis."
+            elif login in comptes:
+                erreur = "Cet identifiant est déjà pris."
+            elif len(mdp) < 6:
+                erreur = "Le mot de passe doit faire au moins 6 caractères."
+            elif mdp != confirmation:
+                erreur = "La confirmation ne correspond pas."
+            elif guild_id not in guilds_valides:
+                erreur = "Merci de sélectionner un serveur Discord valide."
+            else:
+                comptes[login] = {
+                    "password_hash": generate_password_hash(mdp),
+                    "role": "recrue",
+                    "discord_id": discord_id,
+                    "guild_id": guild_id,
+                    "must_change_password": False
+                }
+                sauvegarder_comptes(comptes)
+                session.clear()
+                session["login"] = login
+                session.permanent = True
+                return redirect(url_for("mon_profil"))
+        guilds = list(bot.guilds)
+        corps = render_template_string("""
+        <div class="card" style="max-width:440px;margin:60px auto;">
+          <h1>Créer un compte</h1>
+          <p class="muted">Ton compte sera créé avec le rôle <strong>Recrue</strong>. Un administrateur pourra ensuite te faire progresser.</p>
+          {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+          {% if not guilds %}
+          <div class="flash erreur">Le bot n'est connecté à aucun serveur pour l'instant. Réessaie plus tard.</div>
+          {% else %}
+          <form method="post">
+            <p><input name="login" placeholder="Identifiant" required style="width:100%"></p>
+            <p><input name="mot_de_passe" type="password" placeholder="Mot de passe (6 caractères min.)" required style="width:100%"></p>
+            <p><input name="confirmation" type="password" placeholder="Confirmer le mot de passe" required style="width:100%"></p>
+            <p><input name="discord_id" placeholder="Ton ID Discord (optionnel, recommandé)" style="width:100%"></p>
+            <p>
+              <select name="guild_id" required style="width:100%">
+                <option value="" disabled selected>Choisis ton serveur Discord</option>
+                {% for g in guilds %}
+                <option value="{{ g.id }}">{{ g.name }}</option>
+                {% endfor %}
+              </select>
+            </p>
+            <p class="muted">⚠️ Ce choix est définitif de ton côté : seul un administrateur pourra le modifier ensuite.</p>
+            <button type="submit" style="width:100%">Créer mon compte</button>
+          </form>
+          {% endif %}
+          <p class="muted" style="text-align:center;margin-top:14px;"><a href="/connexion">J'ai déjà un compte</a></p>
+        </div>
+        """, erreur=erreur, guilds=guilds)
+        return page_html("Créer un compte", corps)
 
     @app.route("/connexion", methods=["GET", "POST"])
     def connexion():
@@ -225,7 +367,7 @@ def configurer_site(app, bot, deps):
                 session.permanent = True
                 if compte.get("must_change_password"):
                     return redirect(url_for("changer_mot_de_passe"))
-                if compte.get("role") == "admin":
+                if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
                     return redirect(url_for("admin_serveurs"))
                 return redirect(url_for("mon_profil"))
             erreur = "Identifiant ou mot de passe incorrect."
@@ -238,6 +380,7 @@ def configurer_site(app, bot, deps):
             <p><input name="mot_de_passe" type="password" placeholder="Mot de passe" required style="width:100%"></p>
             <button type="submit" style="width:100%">Se connecter</button>
           </form>
+          <p class="muted" style="text-align:center;margin-top:14px;"><a href="/inscription">Créer un compte</a></p>
         </div>
         """, erreur=erreur)
         return page_html("Connexion", corps)
@@ -289,34 +432,44 @@ def configurer_site(app, bot, deps):
         """, erreur=erreur, ok=ok, force=compte.get("must_change_password", False))
         return page_html("Changer le mot de passe", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : serveurs ----------
+    # ---------- Serveurs (instructeur et plus) ----------
 
     @app.route("/admin/serveurs")
-    @admin_required
+    @role_required("instructeur")
     def admin_serveurs():
-        guilds = list(bot.guilds)
+        compte = compte_connecte()
+        if compte.get("role") == "super_admin":
+            guilds = list(bot.guilds)
+        else:
+            guilds = [g for g in bot.guilds if str(g.id) == str(compte.get("guild_id"))]
         corps = render_template_string("""
         <h1>Serveurs</h1>
         <p class="muted">Sélectionne un serveur pour gérer ses missions, ses profils ou ses missions en cours.</p>
-        {% if not guilds %}<div class="card">Le bot n'est connecté à aucun serveur pour l'instant.</div>{% endif %}
+        {% if not guilds %}<div class="card">Aucun serveur accessible pour ton compte. {% if not super_admin %}Ton compte n'est assigné à aucun serveur, ou celui-ci n'est plus accessible au bot.{% endif %}</div>{% endif %}
         {% for g in guilds %}
         <div class="card row" style="justify-content:space-between;">
           <div><strong>{{ g.name }}</strong><div class="muted">ID : {{ g.id }} — {{ g.member_count }} membres</div></div>
           <div class="row">
+            {% if peut_editer_catalogue %}
             <a class="btnlink" href="/admin/missions/{{ g.id }}">Catalogue</a>
+            {% endif %}
             <a class="btnlink" href="/admin/missions-actives/{{ g.id }}">Missions en cours</a>
             <a class="btnlink" href="/admin/profils/{{ g.id }}">Profils</a>
           </div>
         </div>
         {% endfor %}
-        """, guilds=guilds)
-        return page_html("Serveurs", corps, connecte(), "admin")
+        """, guilds=guilds, super_admin=(compte.get("role") == "super_admin"),
+             peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("admin")))
+        return page_html("Serveurs", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : catalogue de missions ----------
+    # ---------- Catalogue de missions (admin et plus, scope serveur) ----------
 
     @app.route("/admin/missions/<int:guild_id>", methods=["GET", "POST"])
-    @admin_required
+    @role_required("admin")
     def admin_missions(guild_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
         message = None
         if request.method == "POST":
             action = request.form.get("action")
@@ -392,13 +545,16 @@ def configurer_site(app, bot, deps):
           <button class="danger" type="submit">Vider tout le catalogue</button>
         </form>
         """, structure=structure, message=message, guild_id=guild_id)
-        return page_html("Catalogue de missions", corps, connecte(), "admin")
+        return page_html("Catalogue de missions", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : missions en cours ----------
+    # ---------- Missions en cours (instructeur et plus, scope serveur) ----------
 
     @app.route("/admin/missions-actives/<int:guild_id>", methods=["GET", "POST"])
-    @admin_required
+    @role_required("instructeur")
     def admin_missions_actives(guild_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
         missions_actives = deps["missions_actives"]
         message = None
         if request.method == "POST":
@@ -450,13 +606,16 @@ def configurer_site(app, bot, deps):
         </div>
         {% endfor %}
         """, actives=actives, message=message, guild_id=guild_id)
-        return page_html("Missions en cours", corps, connecte(), "admin")
+        return page_html("Missions en cours", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : profils ----------
+    # ---------- Profils (instructeur et plus, scope serveur) ----------
 
     @app.route("/admin/profils/<int:guild_id>")
-    @admin_required
+    @role_required("instructeur")
     def admin_profils(guild_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
         profils = deps["charger_profils"](guild_id)
         corps = render_template_string("""
         <h1>Profils des joueurs</h1>
@@ -476,11 +635,14 @@ def configurer_site(app, bot, deps):
         </table>
         {% endif %}
         """, profils=profils, guild_id=guild_id)
-        return page_html("Profils", corps, connecte(), "admin")
+        return page_html("Profils", corps, connecte(), compte.get("role"))
 
     @app.route("/admin/profils/<int:guild_id>/<joueur_id>")
-    @admin_required
+    @role_required("instructeur")
     def admin_profil_detail(guild_id, joueur_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
         profils = deps["charger_profils"](guild_id)
         profil = profils.get(str(joueur_id))
         if not profil:
@@ -500,57 +662,119 @@ def configurer_site(app, bot, deps):
           {% endfor %}
         </table>
         """, profil=profil, joueur_id=joueur_id, guild_id=guild_id)
-        return page_html("Historique", corps, connecte(), "admin")
+        return page_html("Historique", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : comptes du site ----------
+    # ---------- Admin : comptes du site (admin et plus) ----------
 
     @app.route("/admin/comptes", methods=["GET", "POST"])
-    @admin_required
+    @role_required("admin")
     def admin_comptes():
         message = None
         erreur = None
         mot_de_passe_genere = None
+        acteur = compte_connecte()
+        acteur_role = acteur.get("role")
+        acteur_super = acteur_role == "super_admin"
+
+        def peut_gerer(role_cible):
+            return acteur_super or niveau_role(role_cible) < niveau_role(acteur_role)
+
+        def peut_attribuer(role_demande):
+            return acteur_super or niveau_role(role_demande) < niveau_role(acteur_role)
+
         if request.method == "POST":
             action = request.form.get("action")
             comptes = charger_comptes()
+
             if action == "creer":
                 login = request.form.get("login", "").strip()
-                role = request.form.get("role", "user")
+                role_demande = request.form.get("role", "recrue")
                 discord_id = request.form.get("discord_id", "").strip() or None
                 guild_id = request.form.get("guild_id", "").strip() or None
+                if not acteur_super:
+                    guild_id = acteur.get("guild_id")
                 if not login:
                     erreur = "Identifiant requis."
                 elif login in comptes:
                     erreur = "Cet identifiant existe déjà."
+                elif role_demande not in ROLES_ORDRE or not peut_attribuer(role_demande):
+                    erreur = "Tu ne peux pas attribuer ce rôle."
                 else:
                     mot_de_passe_genere = _generer_mot_de_passe()
                     comptes[login] = {
                         "password_hash": generate_password_hash(mot_de_passe_genere),
-                        "role": role if role in ("admin", "user") else "user",
+                        "role": role_demande,
                         "discord_id": discord_id,
                         "guild_id": guild_id,
                         "must_change_password": True
                     }
                     sauvegarder_comptes(comptes)
                     message = f"Compte « {login} » créé."
+
             elif action == "supprimer":
                 login = request.form.get("login")
+                cible = comptes.get(login)
                 if login == COMPTE_PROPRIETAIRE_LOGIN:
                     erreur = "Impossible de supprimer le compte propriétaire."
-                elif login in comptes:
+                elif not cible:
+                    erreur = "Compte introuvable."
+                elif not peut_gerer(cible.get("role")):
+                    erreur = "Tu n'as pas l'autorité pour supprimer ce compte."
+                else:
                     del comptes[login]
                     sauvegarder_comptes(comptes)
                     message = "Compte supprimé."
+
             elif action == "reinitialiser":
                 login = request.form.get("login")
-                if login in comptes:
+                cible = comptes.get(login)
+                if not cible:
+                    erreur = "Compte introuvable."
+                elif not peut_gerer(cible.get("role")):
+                    erreur = "Tu n'as pas l'autorité pour réinitialiser ce compte."
+                else:
                     mot_de_passe_genere = _generer_mot_de_passe()
                     comptes[login]["password_hash"] = generate_password_hash(mot_de_passe_genere)
                     comptes[login]["must_change_password"] = True
                     sauvegarder_comptes(comptes)
                     message = f"Mot de passe de « {login} » réinitialisé."
 
+            elif action == "modifier":
+                login = request.form.get("login")
+                nouveau_role = request.form.get("role", "")
+                nouveau_guild = request.form.get("guild_id", "").strip()
+                nouveau_discord_id = request.form.get("discord_id", "").strip()
+                cible = comptes.get(login)
+                if not cible:
+                    erreur = "Compte introuvable."
+                elif login == connecte():
+                    erreur = "Tu ne peux pas modifier ton propre compte depuis cette page."
+                elif not peut_gerer(cible.get("role")):
+                    erreur = "Tu n'as pas l'autorité pour modifier ce compte."
+                elif nouveau_role not in ROLES_ORDRE or not peut_attribuer(nouveau_role):
+                    erreur = "Tu ne peux pas attribuer ce rôle."
+                else:
+                    if not acteur_super:
+                        nouveau_guild = acteur.get("guild_id")
+                    cible["role"] = nouveau_role
+                    cible["guild_id"] = nouveau_guild or None
+                    cible["discord_id"] = nouveau_discord_id or None
+                    sauvegarder_comptes(comptes)
+                    message = f"Compte « {login} » mis à jour."
+
         comptes = charger_comptes()
+        if not acteur_super:
+            comptes = {l: c for l, c in comptes.items() if str(c.get("guild_id")) == str(acteur.get("guild_id"))}
+
+        guilds = list(bot.guilds)
+        noms_guildes = {str(g.id): g.name for g in guilds}
+        roles_attribuables = [r for r in ROLES_ORDRE if peut_attribuer(r)]
+
+        lignes_comptes = []
+        for login, c in comptes.items():
+            nom_serveur = noms_guildes.get(str(c.get("guild_id"))) if c.get("guild_id") else None
+            lignes_comptes.append((login, c, nom_serveur))
+
         corps = render_template_string("""
         <h1>Comptes du site</h1>
         {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
@@ -563,25 +787,61 @@ def configurer_site(app, bot, deps):
             <input type="hidden" name="action" value="creer">
             <input name="login" placeholder="Identifiant" required>
             <select name="role">
-              <option value="user">Utilisateur (voit son profil)</option>
-              <option value="admin">Admin</option>
+              {% for r in roles_attribuables %}
+              <option value="{{ r }}">{{ role_labels[r] }}</option>
+              {% endfor %}
             </select>
-            <input name="discord_id" placeholder="ID Discord (pour un compte user)">
-            <input name="guild_id" placeholder="ID du serveur (pour un compte user)">
+            <input name="discord_id" placeholder="ID Discord (optionnel)">
+            {% if acteur_super %}
+            <select name="guild_id">
+              <option value="">— Aucun serveur —</option>
+              {% for g in guilds %}
+              <option value="{{ g.id }}">{{ g.name }}</option>
+              {% endfor %}
+            </select>
+            {% else %}
+            <span class="muted">Serveur : {{ nom_serveur_acteur or acteur_guild or '—' }}</span>
+            {% endif %}
             <button type="submit">Créer</button>
           </form>
           <p class="muted">Le mot de passe temporaire s'affiche une seule fois après la création — il devra être changé à la première connexion.</p>
         </div>
 
         <table>
-          <tr><th>Identifiant</th><th>Rôle</th><th>Discord ID</th><th>Serveur</th><th></th></tr>
-          {% for login, c in comptes.items() %}
+          <tr><th>Identifiant</th><th>Rôle</th><th>Discord ID</th><th>Serveur</th><th>Modifier</th><th>Actions</th></tr>
+          {% for login, c, nom_serveur in lignes_comptes %}
           <tr>
             <td>{{ login }}</td>
-            <td><span class="badge {{ c.role }}">{{ c.role }}</span></td>
+            <td><span class="badge {{ c.role }}">{{ role_labels.get(c.role, c.role) }}</span></td>
             <td>{{ c.discord_id or '—' }}</td>
-            <td>{{ c.guild_id or '—' }}</td>
+            <td>{{ nom_serveur or '—' }}</td>
+            <td>
+              {% if login != connecte_login and peut_gerer(c.role) %}
+              <form method="post" class="row inline">
+                <input type="hidden" name="action" value="modifier">
+                <input type="hidden" name="login" value="{{ login }}">
+                <select name="role">
+                  {% for r in roles_attribuables %}
+                  <option value="{{ r }}" {% if r == c.role %}selected{% endif %}>{{ role_labels[r] }}</option>
+                  {% endfor %}
+                </select>
+                <input name="discord_id" value="{{ c.discord_id or '' }}" placeholder="ID Discord" style="width:130px">
+                {% if acteur_super %}
+                <select name="guild_id">
+                  <option value="">— Aucun —</option>
+                  {% for g in guilds %}
+                  <option value="{{ g.id }}" {% if g.id|string == c.guild_id|string %}selected{% endif %}>{{ g.name }}</option>
+                  {% endfor %}
+                </select>
+                {% endif %}
+                <button class="secondary" type="submit">Enregistrer</button>
+              </form>
+              {% else %}
+              <span class="muted">—</span>
+              {% endif %}
+            </td>
             <td class="row">
+              {% if peut_gerer(c.role) %}
               <form method="post" class="inline">
                 <input type="hidden" name="action" value="reinitialiser">
                 <input type="hidden" name="login" value="{{ login }}">
@@ -594,17 +854,22 @@ def configurer_site(app, bot, deps):
                 <button class="danger" type="submit">Suppr.</button>
               </form>
               {% endif %}
+              {% endif %}
             </td>
           </tr>
           {% endfor %}
         </table>
-        """, comptes=comptes, message=message, erreur=erreur, mot_de_passe=mot_de_passe_genere, proprietaire=COMPTE_PROPRIETAIRE_LOGIN)
-        return page_html("Comptes", corps, connecte(), "admin")
+        """, lignes_comptes=lignes_comptes, message=message, erreur=erreur, mot_de_passe=mot_de_passe_genere,
+             proprietaire=COMPTE_PROPRIETAIRE_LOGIN, guilds=guilds, roles_attribuables=roles_attribuables,
+             role_labels=ROLE_LABELS, acteur_super=acteur_super, acteur_guild=acteur.get("guild_id"),
+             nom_serveur_acteur=noms_guildes.get(str(acteur.get("guild_id"))), connecte_login=connecte(),
+             peut_gerer=peut_gerer)
+        return page_html("Comptes", corps, connecte(), acteur_role)
 
-    # ---------- Admin : sauvegardes ----------
+    # ---------- Admin : sauvegardes (super_admin uniquement) ----------
 
     @app.route("/admin/backup", methods=["GET", "POST"])
-    @admin_required
+    @role_required("super_admin")
     def admin_backup():
         message = None
         erreur = None
@@ -634,21 +899,21 @@ def configurer_site(app, bot, deps):
           </form>
         </div>
         """, message=message, erreur=erreur)
-        return page_html("Sauvegardes", corps, connecte(), "admin")
+        return page_html("Sauvegardes", corps, connecte(), "super_admin")
 
     @app.route("/admin/backup/telecharger")
-    @admin_required
+    @role_required("super_admin")
     def admin_backup_telecharger():
         buffer, nom_fichier, _taille = deps["generer_backup_complet"]()
         return send_file(buffer, as_attachment=True, download_name=nom_fichier, mimetype="application/json")
 
-    # ---------- Utilisateur non-admin : son profil uniquement ----------
+    # ---------- Utilisateur (recrue/membre) : son profil uniquement ----------
 
     @app.route("/mon-profil")
     @login_required
     def mon_profil():
         compte = compte_connecte()
-        if compte.get("role") == "admin":
+        if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
             return redirect(url_for("admin_serveurs"))
         discord_id = compte.get("discord_id")
         guild_id = compte.get("guild_id")
