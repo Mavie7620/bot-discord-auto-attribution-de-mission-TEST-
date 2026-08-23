@@ -10,24 +10,31 @@ des backups...) lui sont injectées via configurer_site(app, bot, deps)
 pour éviter tout import circulaire avec bot.py.
 
 ================= SYSTEME DE RÔLES =================
-Cinq rôles, du plus faible au plus fort :
-  recrue < membre < instructeur < admin < super_admin
+Six rôles, du plus faible au plus fort :
+  recrue < membre < instructeur < admin < super_admin < proprietaire
 
 - N'importe qui avec le lien peut créer un compte via /inscription.
   Le compte créé est toujours "recrue" au départ, et l'inscrit doit
   choisir le serveur Discord auquel il appartient. Ce choix est
   DÉFINITIF de son côté : lui seul ne peut plus le changer ensuite.
 - "instructeur" et plus : accède à /admin/serveurs, mais seulement
-  au(x) serveur(s) qui lui sont assignés (sauf super_admin : tous).
+  au(x) serveur(s) qui lui sont assignés (sauf proprietaire : tous).
 - "admin" et plus : peut en plus gérer le catalogue de missions et
   les comptes du site (créer/modifier/supprimer), mais seulement
   pour son propre serveur, et seulement des comptes d'un rôle
   strictement inférieur au sien (impossible de créer/modifier un
-  compte admin ou super_admin si on n'est pas soi-même super_admin).
-  C'est un admin (ou plus) qui peut changer le serveur assigné à
-  un compte.
-- "super_admin" (Super Modo) : accès à peu près à tout, sur tous
-  les serveurs, y compris les sauvegardes globales.
+  compte super_admin ou proprietaire si on n'est pas soi-même
+  proprietaire). C'est un admin (ou plus) qui peut changer le
+  serveur assigné à un compte.
+- "super_admin" (Super Modo) : mêmes droits qu'un admin, mais
+  reste cantonné à SON SEUL serveur assigné — il n'a aucune vue
+  ni aucun accès sur les autres serveurs.
+- "proprietaire" (Propriétaire) : seul rang avec un accès total et
+  global, sur tous les serveurs, y compris les sauvegardes
+  complètes (/admin/backup). C'est aussi le seul rang habilité à
+  attribuer le rôle "proprietaire" ou "super_admin" à un autre
+  compte, ou à changer le serveur assigné à n'importe quel compte.
+  Le compte historique MAVIE7620 est toujours proprietaire.
 """
 import os
 import json
@@ -41,13 +48,14 @@ COMPTES_FILE = "valerius_comptes.json"
 SECRET_KEY_FILE = "valerius_secret.key"
 COMPTE_PROPRIETAIRE_LOGIN = "MAVIE7620"
 
-ROLES_ORDRE = ["recrue", "membre", "instructeur", "admin", "super_admin"]
+ROLES_ORDRE = ["recrue", "membre", "instructeur", "admin", "super_admin", "proprietaire"]
 ROLE_LABELS = {
     "recrue": "Recrue",
     "membre": "Membre",
     "instructeur": "Instructeur",
     "admin": "Admin",
     "super_admin": "Super Modo",
+    "proprietaire": "Propriétaire",
 }
 
 
@@ -59,10 +67,12 @@ def niveau_role(role):
 
 
 def guild_autorise(compte, guild_id):
-    """True si ce compte a le droit de voir/gérer les données de ce serveur."""
+    """True si ce compte a le droit de voir/gérer les données de ce serveur.
+    Seul le rang Propriétaire a un accès global à tous les serveurs — le
+    Super Modo (super_admin), lui, reste limité à son unique serveur assigné."""
     if not compte:
         return False
-    if compte.get("role") == "super_admin":
+    if compte.get("role") == "proprietaire":
         return True
     return str(compte.get("guild_id")) == str(guild_id)
 
@@ -77,8 +87,8 @@ def _migrer_comptes(comptes):
         if c.get("role") == "user":
             c["role"] = "membre"
             modifie = True
-        if login == COMPTE_PROPRIETAIRE_LOGIN and c.get("role") != "super_admin":
-            c["role"] = "super_admin"
+        if login == COMPTE_PROPRIETAIRE_LOGIN and c.get("role") != "proprietaire":
+            c["role"] = "proprietaire"
             modifie = True
         if c.get("role") not in ROLES_ORDRE:
             c["role"] = "recrue"
@@ -121,7 +131,7 @@ async def initialiser_compte_proprietaire(envoyer_log_proprietaire, bot):
     mot_de_passe = _generer_mot_de_passe()
     comptes[COMPTE_PROPRIETAIRE_LOGIN] = {
         "password_hash": generate_password_hash(mot_de_passe),
-        "role": "super_admin",
+        "role": "proprietaire",
         "discord_id": None,
         "guild_id": None,
         "must_change_password": True
@@ -186,6 +196,7 @@ STYLE = """
   .badge.instructeur { background:#1f3a34; color:#5fd0b0; }
   .badge.admin { background:#3a2f1f; color:#e0b64d; }
   .badge.super_admin { background:#3a1f34; color:#e07ec8; }
+  .badge.proprietaire { background:#4a3a10; color:#ffd166; border:1px solid #ffd166; }
   form.inline { display:inline; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   .muted { color:#8f8fa3; font-size:13px; }
@@ -203,11 +214,12 @@ def page_html(titre, corps, connecte=None, role=None):
             liens.append('<a href="/admin/serveurs">Serveurs</a>')
         if niveau >= niveau_role("admin"):
             liens.append('<a href="/admin/comptes">Comptes</a>')
-        if niveau >= niveau_role("super_admin"):
+        if niveau >= niveau_role("proprietaire"):
             liens.append('<a href="/admin/backup">Sauvegardes</a>')
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
-        badge = f'<span class="badge {role}">{ROLE_LABELS.get(role, role)}</span>' if role else ""
+        badge_icone = "👑 " if role == "proprietaire" else ""
+        badge = f'<span class="badge {role}">{badge_icone}{ROLE_LABELS.get(role, role)}</span>' if role else ""
         nav_liens = "".join(liens) + f'<span class="muted">{connecte}</span>{badge}<a href="/deconnexion">Déconnexion</a>'
     return f"""<!DOCTYPE html>
 <html lang="fr">
@@ -259,7 +271,7 @@ def configurer_site(app, bot, deps):
 
     def role_required(min_role):
         """Exige d'être connecté ET d'avoir au moins ce rôle dans la
-        hiérarchie recrue < membre < instructeur < admin < super_admin."""
+        hiérarchie recrue < membre < instructeur < admin < super_admin < proprietaire."""
         def decorateur(f):
             @functools.wraps(f)
             def wrapper(*a, **kw):
@@ -438,7 +450,7 @@ def configurer_site(app, bot, deps):
     @role_required("instructeur")
     def admin_serveurs():
         compte = compte_connecte()
-        if compte.get("role") == "super_admin":
+        if compte.get("role") == "proprietaire":
             guilds = list(bot.guilds)
         else:
             guilds = [g for g in bot.guilds if str(g.id) == str(compte.get("guild_id"))]
@@ -458,7 +470,7 @@ def configurer_site(app, bot, deps):
           </div>
         </div>
         {% endfor %}
-        """, guilds=guilds, super_admin=(compte.get("role") == "super_admin"),
+        """, guilds=guilds, super_admin=(compte.get("role") == "proprietaire"),
              peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("admin")))
         return page_html("Serveurs", corps, connecte(), compte.get("role"))
 
@@ -674,7 +686,11 @@ def configurer_site(app, bot, deps):
         mot_de_passe_genere = None
         acteur = compte_connecte()
         acteur_role = acteur.get("role")
-        acteur_super = acteur_role == "super_admin"
+        # Seul un Propriétaire a le pouvoir total : attribuer n'importe quel
+        # rôle (y compris Propriétaire/Super Modo) et choisir n'importe quel
+        # serveur. Un Super Modo, lui, reste cantonné à son propre serveur,
+        # exactement comme un admin.
+        acteur_super = acteur_role == "proprietaire"
 
         def peut_gerer(role_cible):
             return acteur_super or niveau_role(role_cible) < niveau_role(acteur_role)
@@ -753,6 +769,8 @@ def configurer_site(app, bot, deps):
                     erreur = "Tu n'as pas l'autorité pour modifier ce compte."
                 elif nouveau_role not in ROLES_ORDRE or not peut_attribuer(nouveau_role):
                     erreur = "Tu ne peux pas attribuer ce rôle."
+                elif login == COMPTE_PROPRIETAIRE_LOGIN and nouveau_role != "proprietaire":
+                    erreur = "Le compte propriétaire historique doit toujours rester Propriétaire."
                 else:
                     if not acteur_super:
                         nouveau_guild = acteur.get("guild_id")
@@ -866,10 +884,10 @@ def configurer_site(app, bot, deps):
              peut_gerer=peut_gerer)
         return page_html("Comptes", corps, connecte(), acteur_role)
 
-    # ---------- Admin : sauvegardes (super_admin uniquement) ----------
+    # ---------- Admin : sauvegardes (proprietaire uniquement — accès total) ----------
 
     @app.route("/admin/backup", methods=["GET", "POST"])
-    @role_required("super_admin")
+    @role_required("proprietaire")
     def admin_backup():
         message = None
         erreur = None
@@ -899,10 +917,10 @@ def configurer_site(app, bot, deps):
           </form>
         </div>
         """, message=message, erreur=erreur)
-        return page_html("Sauvegardes", corps, connecte(), "super_admin")
+        return page_html("Sauvegardes", corps, connecte(), "proprietaire")
 
     @app.route("/admin/backup/telecharger")
-    @role_required("super_admin")
+    @role_required("proprietaire")
     def admin_backup_telecharger():
         buffer, nom_fichier, _taille = deps["generer_backup_complet"]()
         return send_file(buffer, as_attachment=True, download_name=nom_fichier, mimetype="application/json")
