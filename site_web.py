@@ -40,6 +40,7 @@ import os
 import json
 import secrets
 import functools
+from datetime import datetime
 
 from flask import request, redirect, url_for, session, send_file, abort, render_template_string
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -273,6 +274,27 @@ STYLE = """
     transition: all .15s ease;
   }
   a.btnlink:hover { background:#2a2c38; border-color:#3a3c4c; transform:translateY(-1px); }
+
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:14px; margin:16px 0; }
+  .stat-card {
+    background:linear-gradient(180deg, var(--panel), var(--panel-2));
+    border:1px solid var(--border); border-radius:14px; padding:18px 20px; box-shadow:var(--shadow);
+  }
+  .stat-card .valeur { font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; }
+  .stat-card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-top:4px; }
+
+  .log-entry {
+    display:flex; gap:14px; padding:12px 16px; border-bottom:1px solid var(--border);
+    font-size:13.5px; align-items:flex-start;
+  }
+  .log-entry:last-child { border-bottom:none; }
+  .log-entry:hover { background:rgba(255,255,255,0.02); }
+  .log-entry .date { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; min-width:150px; }
+  .log-entry .texte { color:#dcdde8; word-break:break-word; }
+
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:20px; font-size:12px; font-weight:700; }
+  .pill.on { background:rgba(63,214,140,0.14); color:#8bf0c0; }
+  .pill.off { background:rgba(239,90,86,0.14); color:#ff9d9d; }
 </style>
 """
 
@@ -287,6 +309,9 @@ def page_html(titre, corps, connecte=None, role=None):
         if niveau >= niveau_role("admin"):
             liens.append('<a href="/admin/comptes">Comptes</a>')
         if niveau >= niveau_role("proprietaire"):
+            liens.append('<a href="/admin/dashboard">Tableau de bord</a>')
+            liens.append('<a href="/admin/logs">Logs</a>')
+            liens.append('<a href="/admin/securite">Sécurité</a>')
             liens.append('<a href="/admin/backup">Sauvegardes</a>')
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
@@ -996,6 +1021,145 @@ def configurer_site(app, bot, deps):
     def admin_backup_telecharger():
         buffer, nom_fichier, _taille = deps["generer_backup_complet"]()
         return send_file(buffer, as_attachment=True, download_name=nom_fichier, mimetype="application/json")
+
+    # ---------- Tableau de bord (proprietaire uniquement) ----------
+
+    @app.route("/admin/dashboard")
+    @role_required("proprietaire")
+    def admin_dashboard():
+        guilds = list(bot.guilds)
+        nb_membres = sum(g.member_count or 0 for g in guilds)
+        missions_actives = deps["missions_actives"]
+        nb_missions_actives = sum(len(j) for j in missions_actives.values())
+        latence_ms = round(bot.latency * 1000) if bot.latency else 0
+        depart = deps["bot_start_time"]
+        delta = datetime.now() - depart
+        jours, reste = delta.days, delta.seconds
+        heures, reste = divmod(reste, 3600)
+        minutes = reste // 60
+        uptime = f"{jours}j {heures}h {minutes}mn" if jours else f"{heures}h {minutes}mn"
+
+        lignes_serveurs = []
+        for g in guilds:
+            nb_actives_g = len(missions_actives.get(g.id, {}))
+            lignes_serveurs.append((g, nb_actives_g))
+
+        corps = render_template_string("""
+        <h1>Tableau de bord</h1>
+        <p class="muted">Vue d'ensemble globale, tous serveurs confondus.</p>
+
+        <div class="stats-grid">
+          <div class="stat-card"><div class="valeur">{{ guilds|length }}</div><div class="label">Serveurs</div></div>
+          <div class="stat-card"><div class="valeur">{{ nb_membres }}</div><div class="label">Membres au total</div></div>
+          <div class="stat-card"><div class="valeur">{{ nb_missions_actives }}</div><div class="label">Missions en cours</div></div>
+          <div class="stat-card"><div class="valeur">{{ latence_ms }} ms</div><div class="label">Latence Discord</div></div>
+          <div class="stat-card"><div class="valeur">{{ uptime }}</div><div class="label">En ligne depuis</div></div>
+        </div>
+
+        <h2>Détail par serveur</h2>
+        {% for g, nb_actives_g in lignes_serveurs %}
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>{{ g.name }}</strong><div class="muted">ID : {{ g.id }} — {{ g.member_count }} membres</div></div>
+          <div class="row">
+            <span class="pill {{ 'on' if nb_actives_g else 'off' }}">{{ nb_actives_g }} mission(s) en cours</span>
+            <a class="btnlink" href="/admin/serveurs">Gérer</a>
+          </div>
+        </div>
+        {% endfor %}
+        """, guilds=guilds, nb_membres=nb_membres, nb_missions_actives=nb_missions_actives,
+             latence_ms=latence_ms, uptime=uptime, lignes_serveurs=lignes_serveurs)
+        return page_html("Tableau de bord", corps, connecte(), "proprietaire")
+
+    # ---------- Logs du bot (proprietaire uniquement) ----------
+
+    @app.route("/admin/logs")
+    @role_required("proprietaire")
+    def admin_logs():
+        logs = deps["charger_logs_recents"](200)
+        corps = render_template_string("""
+        <h1>Logs du bot</h1>
+        <p class="muted">Les {{ logs|length }} derniers événements (les plus récents en premier). Les mêmes logs partent aussi en MP Discord.</p>
+        <div class="card" style="padding:0;">
+          {% if not logs %}
+          <div style="padding:20px;" class="muted">Aucun log pour l'instant.</div>
+          {% endif %}
+          {% for l in logs %}
+          <div class="log-entry">
+            <span class="date">{{ l.date }}</span>
+            <span class="texte">{{ l.texte }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        <p class="muted"><a href="/admin/logs">🔄 Rafraîchir</a></p>
+        """, logs=logs)
+        return page_html("Logs", corps, connecte(), "proprietaire")
+
+    # ---------- Sécurité : code d'activation (proprietaire uniquement) ----------
+
+    @app.route("/admin/securite", methods=["GET", "POST"])
+    @role_required("proprietaire")
+    def admin_securite():
+        message = None
+        erreur = None
+        if request.method == "POST":
+            action = request.form.get("action")
+            if action == "changer_code":
+                nouveau_code = request.form.get("nouveau_code", "").strip()
+                if len(nouveau_code) < 6:
+                    erreur = "Le nouveau code doit faire au moins 6 caractères."
+                else:
+                    deps["sauvegarder_code_verrou"](nouveau_code)
+                    message = "Code d'activation mis à jour avec succès."
+            elif action == "verrouiller":
+                guild_id = int(request.form.get("guild_id"))
+                deps["guildes_deverrouillees"].discard(guild_id)
+                message = "Serveur reverrouillé."
+            elif action == "deverrouiller":
+                guild_id = int(request.form.get("guild_id"))
+                deps["guildes_deverrouillees"].add(guild_id)
+                message = "Serveur déverrouillé."
+
+        code_actuel = deps["charger_code_verrou"]()
+        guilds = list(bot.guilds)
+        deverrouillees = deps["guildes_deverrouillees"]
+        lignes_serveurs = [(g, g.id in deverrouillees) for g in guilds]
+
+        corps = render_template_string("""
+        <h1>Sécurité</h1>
+        {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        <div class="card">
+          <h2 style="margin-top:0">Code d'activation</h2>
+          <p class="muted">Code actuel : <strong>{{ code_actuel }}</strong></p>
+          <form method="post" class="row">
+            <input type="hidden" name="action" value="changer_code">
+            <input name="nouveau_code" placeholder="Nouveau code (6 caractères min.)" style="flex:1;min-width:220px" required>
+            <button type="submit" onclick="return confirm('Changer le code va invalider l\\'ancien sur tous les serveurs verrouillés. Continuer ?')">Changer le code</button>
+          </form>
+        </div>
+
+        <h2>Verrouillage par serveur</h2>
+        {% for g, deverrouille in lignes_serveurs %}
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>{{ g.name }}</strong><div class="muted">ID : {{ g.id }}</div></div>
+          <div class="row">
+            <span class="pill {{ 'on' if deverrouille else 'off' }}">{{ 'Déverrouillé' if deverrouille else 'Verrouillé' }}</span>
+            <form method="post" class="inline">
+              <input type="hidden" name="guild_id" value="{{ g.id }}">
+              {% if deverrouille %}
+              <input type="hidden" name="action" value="verrouiller">
+              <button class="danger" type="submit">Reverrouiller</button>
+              {% else %}
+              <input type="hidden" name="action" value="deverrouiller">
+              <button class="secondary" type="submit">Déverrouiller</button>
+              {% endif %}
+            </form>
+          </div>
+        </div>
+        {% endfor %}
+        """, message=message, erreur=erreur, code_actuel=code_actuel, lignes_serveurs=lignes_serveurs)
+        return page_html("Sécurité", corps, connecte(), "proprietaire")
 
     # ---------- Utilisateur (recrue/membre) : son profil uniquement ----------
 

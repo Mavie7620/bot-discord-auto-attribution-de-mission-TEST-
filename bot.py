@@ -34,6 +34,8 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+BOT_START_TIME = datetime.now()
+
 PROPRIETAIRE_ID = 1109866808321769472
 WELCOME_CHANNEL_ID = 1534604841660190792
 ATTENTE_MOOV_ID = 1534604587992875280
@@ -232,9 +234,48 @@ def verifier_permissions_staff(user):
     roles_noms = [r.name for r in user.roles]
     return user.guild_permissions.administrator or "[ [ 𝔦𝔫𝔰𝔱𝔯𝔲𝔠𝔱𝔢𝔲𝔯 ] ]" in roles_noms or "[ Palais Royal ]" in roles_noms or "Palais Royal" in roles_noms or any(r.permissions.manage_channels or r.permissions.administrator for r in user.roles)
 
+LOGS_FILE = "valerius_logs_globaux.jsonl"
+LOGS_MAX_CONSERVES = 500
+
+def sauvegarder_log_disque(texte_log):
+    """Ajoute une ligne au fichier de logs (persiste entre redémarrages) et
+    tronque le fichier pour ne garder que les LOGS_MAX_CONSERVES plus récents."""
+    try:
+        ligne = json.dumps({"date": datetime.now().strftime("%d/%m/%Y à %H:%M:%S"), "texte": texte_log}, ensure_ascii=False)
+        with open(LOGS_FILE, "a", encoding="utf-8") as f:
+            f.write(ligne + "\n")
+        with open(LOGS_FILE, "r", encoding="utf-8") as f:
+            lignes = f.readlines()
+        if len(lignes) > LOGS_MAX_CONSERVES:
+            with open(LOGS_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lignes[-LOGS_MAX_CONSERVES:])
+    except Exception as e:
+        print(f"[LOGS DISQUE] Erreur d'écriture : {e}")
+
+def charger_logs_recents(limite=200):
+    """Renvoie les logs les plus récents en premier (liste de dicts date/texte)."""
+    if not os.path.exists(LOGS_FILE):
+        return []
+    try:
+        with open(LOGS_FILE, "r", encoding="utf-8") as f:
+            lignes = f.readlines()
+    except Exception:
+        return []
+    logs = []
+    for ligne in reversed(lignes[-limite:]):
+        ligne = ligne.strip()
+        if not ligne: continue
+        try:
+            logs.append(json.loads(ligne))
+        except Exception:
+            continue
+    return logs
+
 async def envoyer_log_proprietaire(bot_instance, texte_log, view=None, guild_target=None, joueur_id_target=None):
     """Envoie le log complet en message privé à TOUS les comptes Propriétaires,
-    et seulement à eux — c'est le seul rang à recevoir l'intégralité des logs."""
+    et seulement à eux — c'est le seul rang à recevoir l'intégralité des logs.
+    Le log est aussi toujours persisté sur disque pour être consultable sur le site."""
+    sauvegarder_log_disque(texte_log)
     au_moins_un_envoye = False
     for owner_id in charger_proprietaires():
         membre = bot_instance.get_user(owner_id)
@@ -2084,6 +2125,11 @@ site_web.configurer_site(app, bot, {
     "missions_actives": missions_actives,
     "generer_backup_complet": generer_backup_complet,
     "restaurer_donnees_backup": restaurer_donnees_backup,
+    "charger_logs_recents": charger_logs_recents,
+    "bot_start_time": BOT_START_TIME,
+    "charger_code_verrou": charger_code_verrou,
+    "sauvegarder_code_verrou": sauvegarder_code_verrou,
+    "guildes_deverrouillees": guildes_deverrouillees,
 })
 
 keep_alive()
