@@ -11,6 +11,7 @@ from threading import Thread
 from flask import Flask
 from datetime import datetime, timedelta
 import io
+import site_web
 
 app = Flask('')
 
@@ -1096,7 +1097,9 @@ async def on_ready():
     bot.add_view(VueAccueilArrivant())
     bot.add_view(VueGestionJoueurMission())
     bot.add_view(VueEvaluationMission())
-    
+
+    await site_web.initialiser_compte_proprietaire(envoyer_log_proprietaire, bot)
+
     await envoyer_log_proprietaire(bot, f"🚀 **Bot Valerius démarré avec succès !** Connecté et opérationnel.")
 
     guildes_deverrouillees.clear()
@@ -1446,9 +1449,11 @@ def generer_backup_complet():
     import glob
     fichiers_txt = glob.glob("valerius_missions_*.txt")
     fichiers_json = glob.glob("valerius_profils_*.json")
-    # Le code d'activation doit lui aussi survivre à un redémarrage sur Render.
-    if os.path.exists(VERROU_FILE):
-        fichiers_json.append(VERROU_FILE)
+    # Le code d'activation et les comptes du site web doivent eux aussi
+    # survivre à un redémarrage sur Render (disque non-persistant).
+    for f_extra in (VERROU_FILE, site_web.COMPTES_FILE, site_web.SECRET_KEY_FILE):
+        if os.path.exists(f_extra):
+            fichiers_json.append(f_extra)
 
     contenu_fichiers = {}
     for f_path in fichiers_txt + fichiers_json:
@@ -1526,6 +1531,48 @@ async def sauvegarde_automatique():
 async def avant_sauvegarde_automatique():
     await bot.wait_until_ready()
 
+def restaurer_donnees_backup(donnees, channel_fallback=None):
+    """Réinjecte un backup total (fichiers disque + missions en cours).
+    Fonction partagée entre /total_restore (Discord) et le site web admin."""
+    fichiers_disques = donnees.get("fichiers_disques", {})
+    for f_path, f_contenu in fichiers_disques.items():
+        with open(f_path, "w", encoding="utf-8") as f:
+            f.write(f_contenu)
+
+    global missions_actives
+    missions_actives.clear()
+
+    m_actives_sauvegardees = donnees.get("missions_actives", {})
+    nb_restaurees = 0
+    for str_g_id, j_dict in m_actives_sauvegardees.items():
+        g_id = int(str_g_id)
+        missions_actives[g_id] = {}
+        guild_obj = bot.get_guild(g_id)
+
+        for str_j_id, m_data in j_dict.items():
+            j_id = int(str_j_id)
+            old_channel_id = m_data["channel_id"]
+            target_channel = bot.get_channel(old_channel_id)
+            if not target_channel and guild_obj and channel_fallback:
+                target_channel = channel_fallback
+            final_channel_id = target_channel.id if target_channel else old_channel_id
+
+            missions_actives[g_id][j_id] = {
+                "texte": m_data["texte"],
+                "delai_texte": m_data["delai_texte"],
+                "date_debut": datetime.fromisoformat(m_data["date_debut"]),
+                "date_fin": datetime.fromisoformat(m_data["date_fin"]),
+                "duree_totale": timedelta(seconds=m_data["duree_totale_seconds"]),
+                "cat": m_data["cat"],
+                "channel_id": final_channel_id,
+                "alerte_moitie": m_data["alerte_moitie"],
+                "alerte_un_quart": m_data["alerte_un_quart"],
+                "en_attente": m_data["en_attente"]
+            }
+            nb_restaurees += 1
+
+    return nb_restaurees, len(fichiers_disques)
+
 @bot.tree.command(name="total_restore", description="Restaure toutes les données à partir d'un fichier de backup.")
 @app_commands.describe(fichier="Le fichier .json de sauvegarde totale")
 async def total_restore(interaction: discord.Interaction, fichier: discord.Attachment):
@@ -1538,44 +1585,8 @@ async def total_restore(interaction: discord.Interaction, fichier: discord.Attac
     try:
         contenu_bytes = await fichier.read()
         donnees = json.loads(contenu_bytes.decode("utf-8"))
-
-        fichiers_disques = donnees.get("fichiers_disques", {})
-        for f_path, f_contenu in fichiers_disques.items():
-            with open(f_path, "w", encoding="utf-8") as f:
-                f.write(f_contenu)
-
-        global missions_actives
-        missions_actives.clear()
-        
-        m_actives_sauvegardees = donnees.get("missions_actives", {})
-        for str_g_id, j_dict in m_actives_sauvegardees.items():
-            g_id = int(str_g_id)
-            missions_actives[g_id] = {}
-            guild_obj = bot.get_guild(g_id)
-            
-            for str_j_id, m_data in j_dict.items():
-                j_id = int(str_j_id)
-                old_channel_id = m_data["channel_id"]
-                target_channel = bot.get_channel(old_channel_id)
-                if not target_channel and guild_obj:
-                    target_channel = interaction.channel
-                
-                final_channel_id = target_channel.id if target_channel else old_channel_id
-
-                missions_actives[g_id][j_id] = {
-                    "texte": m_data["texte"],
-                    "delai_texte": m_data["delai_texte"],
-                    "date_debut": datetime.fromisoformat(m_data["date_debut"]),
-                    "date_fin": datetime.fromisoformat(m_data["date_fin"]),
-                    "duree_totale": timedelta(seconds=m_data["duree_totale_seconds"]),
-                    "cat": m_data["cat"],
-                    "channel_id": final_channel_id,
-                    "alerte_moitie": m_data["alerte_moitie"],
-                    "alerte_un_quart": m_data["alerte_un_quart"],
-                    "en_attente": m_data["en_attente"]
-                }
-
-        await interaction.followup.send("✅ **Restauration réussie !** Les salons et les missions en cours ont été réassociés avec succès.", ephemeral=True)
+        nb_restaurees, nb_fichiers = restaurer_donnees_backup(donnees, channel_fallback=interaction.channel)
+        await interaction.followup.send(f"✅ **Restauration réussie !** {nb_fichiers} fichier(s) et {nb_restaurees} mission(s) en cours réinjectés.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Erreur lors de la restauration du fichier : {e}", ephemeral=True)
 
@@ -1851,6 +1862,22 @@ async def delmission(interaction: discord.Interaction, categorie: str, numero: i
         await interaction.response.send_message(f"🗑️ Mission *\"{retiree['texte']}\"* supprimée de l'index de ce serveur.", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Numéro introuvable dans cette catégorie.", ephemeral=True)
+
+# ================= SITE WEB D'ADMINISTRATION =================
+# Même app Flask que keep_alive() : un seul process, un seul serveur Render.
+site_web.configurer_site(app, bot, {
+    "charger_missions_fichier": charger_missions_fichier,
+    "sauvegarder_mission_fichier": sauvegarder_mission_fichier,
+    "reecrire_toutes_missions": reecrire_toutes_missions,
+    "vider_toutes_missions": vider_toutes_missions,
+    "charger_profils": charger_profils,
+    "sauvegarder_profils": sauvegarder_profils,
+    "initialiser_profil": initialiser_profil,
+    "ajouter_historique": ajouter_historique,
+    "missions_actives": missions_actives,
+    "generer_backup_complet": generer_backup_complet,
+    "restaurer_donnees_backup": restaurer_donnees_backup,
+})
 
 keep_alive()
 token = os.environ.get("DIS_TOKEN") or os.environ.get("DISCORD_TOKEN")
