@@ -15,7 +15,13 @@ import site_web
 
 app = Flask('')
 
-@app.route('/')
+# NOTE : cette route servait de "ping" de survie pour Render/UptimeRobot.
+# Elle a été déplacée de "/" vers "/ping" car "/" est maintenant utilisé
+# par le vrai site web (site_web.py -> racine()) : les deux routes se
+# disputaient la même URL, et comme cette route était enregistrée en
+# premier (au chargement du module), c'est toujours elle qui répondait,
+# empêchant d'accéder au site (redirection vers /connexion).
+@app.route('/ping')
 def home(): return "Le bot Valerius est vivant !"
 
 def run_web(): app.run(host='0.0.0.0', port=8080)
