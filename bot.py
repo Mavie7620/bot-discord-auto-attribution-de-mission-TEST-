@@ -143,6 +143,19 @@ TEXTE_ECHEC = (
     "- *Les missions constituent l'un des principaux moyens de progresser au sein de Valerius.*"
 )
 
+class VueVerrouillable(discord.ui.View):
+    """Vue de base : bloque automatiquement TOUS les boutons (pas seulement
+    les commandes slash) tant que le serveur n'a pas saisi le bon code
+    d'activation via /deverrouiller."""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and guilde_verrouillee(interaction.guild):
+            try:
+                await interaction.response.send_message(MESSAGE_VERROU, ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
 def verifier_permissions_staff(user):
     roles_noms = [r.name for r in user.roles]
     return user.guild_permissions.administrator or "[ [ 𝔦𝔫𝔰𝔱𝔯𝔲𝔠𝔱𝔢𝔲𝔯 ] ]" in roles_noms or "[ Palais Royal ]" in roles_noms or "Palais Royal" in roles_noms or any(r.permissions.manage_channels or r.permissions.administrator for r in user.roles)
@@ -176,7 +189,7 @@ async def envoyer_double_notification(guild, msg_ticket, msg_missions, view=None
     
     await envoyer_log_proprietaire(bot, f"[{guild.name}] {msg_missions}", view=VueEvaluationMissionMP if view else None, guild_target=guild, joueur_id_target=joueur_id)
 
-class VueFermerTicket(discord.ui.View):
+class VueFermerTicket(VueVerrouillable):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -195,7 +208,7 @@ class VueFermerTicket(discord.ui.View):
         try: await interaction.channel.delete()
         except: pass
 
-class VueButinRecupere(discord.ui.View):
+class VueButinRecupere(VueVerrouillable):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -210,7 +223,7 @@ class VueButinRecupere(discord.ui.View):
             pass
         await interaction.channel.send("✅ **Le butin a été récupéré avec succès par l'instructeur.**", view=VueFermerTicket())
 
-class VueAccueilArrivant(discord.ui.View):
+class VueAccueilArrivant(VueVerrouillable):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -263,7 +276,7 @@ class VueAccueilArrivant(discord.ui.View):
         except Exception as e:
             await interaction.response.send_message(f"❌ Une erreur est survenue : {e}", ephemeral=True)
 
-class VueGestionJoueurMission(discord.ui.View):
+class VueGestionJoueurMission(VueVerrouillable):
     def __init__(self, joueur_id=None):
         super().__init__(timeout=None)
         self.joueur_id = joueur_id
@@ -342,7 +355,7 @@ class VueGestionJoueurMission(discord.ui.View):
         await action_refuser_mission(target_id, interaction.channel)
         await envoyer_log_proprietaire(bot, f"LOG ABSOLU - JOUEUR ABANDONNER : {interaction.user.name} a abandonné sa mission sur {interaction.guild.name}")
 
-class VueEvaluationMission(discord.ui.View):
+class VueEvaluationMission(VueVerrouillable):
     def __init__(self, joueur_id=None):
         super().__init__(timeout=None)
         self.joueur_id = joueur_id
@@ -432,7 +445,7 @@ class VueEvaluationMission(discord.ui.View):
         else:
             await interaction.followup.send("❌ Impossible de lier cette demande à un joueur actif.", ephemeral=True)
 
-class VueEvaluationMissionMP(discord.ui.View):
+class VueEvaluationMissionMP(VueVerrouillable):
     def __init__(self, guild_target, joueur_id):
         super().__init__(timeout=None)
         self.guild_target = guild_target
@@ -635,7 +648,7 @@ async def verifier_temps_missions():
             if joueur_id in missions_actives[guild_id]: 
                 del missions_actives[guild_id][joueur_id]
 
-class VueBoutonTicket(discord.ui.View):
+class VueBoutonTicket(VueVerrouillable):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -676,7 +689,7 @@ class VueBoutonTicket(discord.ui.View):
         asyncio.create_task(gerer_expiration_automatique(guild, ticket_channel.id, joueur.id))
         await interaction.followup.send(f"✅ Ton ticket a été créé ici : {ticket_channel.mention}", ephemeral=True)
 
-class VueChoixDifficulte(discord.ui.View):
+class VueChoixDifficulte(VueVerrouillable):
     def __init__(self, joueur_id):
         super().__init__(timeout=600)
         self.joueur_id = joueur_id
@@ -952,17 +965,38 @@ async def supprimer_toutes_missions_cmd(ctx):
 
 
 # ================= SYSTEME DE VERROUILLAGE PAR CODE =================
+import secrets
+
 VERROU_FILE = "valerius_verrou.json"
-CODE_PAR_DEFAUT = "maDaGa2026"
 
 guildes_deverrouillees = set()
+
+def _generer_code_aleatoire():
+    # Code lisible mais imprévisible, jamais stocké en clair dans le code source
+    # (contrairement à l'ancien "maDaGa2026" visible sur un repo GitHub public).
+    return secrets.token_urlsafe(9)
 
 def charger_code_verrou():
     try:
         with open(VERROU_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("code", CODE_PAR_DEFAUT)
+            code = json.load(f).get("code")
+            if code:
+                return code
     except Exception:
-        return CODE_PAR_DEFAUT
+        pass
+
+    # Priorité à une variable d'environnement (comme le token Discord),
+    # sinon on génère un code aléatoire unique qu'on sauvegarde localement.
+    code_env = os.environ.get("VALERIUS_CODE_ACTIVATION")
+    code = code_env if code_env else _generer_code_aleatoire()
+    sauvegarder_code_verrou(code)
+    if not code_env:
+        asyncio.create_task(envoyer_log_proprietaire(
+            bot,
+            f"🔑 Aucun code d'activation existant : un nouveau code a été généré automatiquement : `{code}`\n"
+            f"Conserve-le précieusement (il est aussi inclus dans les `/total_backup`)."
+        ))
+    return code
 
 def sauvegarder_code_verrou(nouveau_code):
     with open(VERROU_FILE, "w", encoding="utf-8") as f:
@@ -1412,6 +1446,9 @@ def generer_backup_complet():
     import glob
     fichiers_txt = glob.glob("valerius_missions_*.txt")
     fichiers_json = glob.glob("valerius_profils_*.json")
+    # Le code d'activation doit lui aussi survivre à un redémarrage sur Render.
+    if os.path.exists(VERROU_FILE):
+        fichiers_json.append(VERROU_FILE)
 
     contenu_fichiers = {}
     for f_path in fichiers_txt + fichiers_json:
