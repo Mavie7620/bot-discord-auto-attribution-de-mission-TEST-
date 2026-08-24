@@ -439,7 +439,7 @@ def page_html(titre, corps, connecte=None, role=None):
 </head>
 <body>
 <div id="grille-curseur"></div>
-<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/static/drapeau.png" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
+<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/drapeau.png" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
 <main>
 {corps}
 </main>
@@ -487,12 +487,14 @@ STYLE_PAYS = """
     text-align:center;
   }
   .pays-drapeau {
-    display:block; width:88px; height:60px; object-fit:cover; border-radius:8px;
+    display:block; width:96px; height:52px; object-fit:contain; border-radius:8px;
     margin:0 auto 26px; box-shadow:0 8px 24px -8px rgba(0,0,0,0.7); border:1px solid rgba(255,255,255,0.12);
+    background:#000; padding:4px; image-rendering:pixelated; image-rendering:crisp-edges;
   }
   nav .drapeau-nav {
-    display:inline-block; width:22px; height:15px; object-fit:cover; border-radius:3px;
+    display:inline-block; width:24px; height:13px; object-fit:contain; border-radius:3px;
     border:1px solid rgba(255,255,255,0.15); vertical-align:middle; margin-right:6px;
+    background:#000; image-rendering:pixelated; image-rendering:crisp-edges;
   }
   .pays-eyebrow {
     font-size:12px; letter-spacing:3px; text-transform:uppercase; color:var(--muted);
@@ -618,7 +620,7 @@ def page_accueil_pays(connecte=None, role=None):
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="icon" href="/static/drapeau.png">
+<link rel="icon" href="/drapeau.png">
 {STYLE}
 {STYLE_PAYS}
 </head>
@@ -626,7 +628,7 @@ def page_accueil_pays(connecte=None, role=None):
 <div id="grille-curseur"></div>
 {nav_html}
 <div class="pays-body">
-  <img class="pays-drapeau" src="/static/drapeau.png" alt="Drapeau de Madagascar">
+  <img class="pays-drapeau" src="/drapeau.png" alt="Drapeau de Madagascar">
   <div class="pays-eyebrow">Portail officiel</div>
   <h1 class="pays-titre">MADAGASCAR</h1>
   <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
@@ -713,6 +715,17 @@ def configurer_site(app, bot, deps):
         return decorateur
 
     # ---------- Authentification ----------
+
+    @app.route("/drapeau.png")
+    def drapeau_image():
+        """Sert l'image du drapeau depuis la racine du dépôt (à côté de
+        bot.py), sans exposer le reste des fichiers du dépôt. Route
+        publique : utilisée aussi sur les pages de connexion/inscription,
+        avant que le visiteur ait un compte."""
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drapeau.png")
+        if not os.path.exists(chemin):
+            abort(404)
+        return send_file(chemin, mimetype="image/png")
 
     @app.route("/")
     @login_required
