@@ -185,12 +185,12 @@ STYLE = """
     --border: #2b2b30;
     --text: #f2f2f4;
     --muted: #94949c;
-    --gold: #e50914;
-    --gold-2: #ff2d3e;
+    --gold: #e8bd55;
+    --gold-2: #f4d485;
     --red: #e50914;
     --green: #3fd68c;
     --shadow: 0 10px 30px -12px rgba(0,0,0,0.7);
-    --font-title: "Poppins", "Segoe UI", sans-serif;
+    --font-title: "Cinzel", "Segoe UI", serif;
     --font-body: "Inter", "Segoe UI", -apple-system, Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
@@ -218,9 +218,10 @@ STYLE = """
   }
   nav a:hover { color:#fff; background:var(--panel-2); }
   nav .brand {
-    font-family:var(--font-title); font-weight:800; font-size:19px; letter-spacing:.5px; margin-right:auto;
-    color:var(--gold); text-transform:uppercase;
-    text-shadow: 0 0 24px rgba(229,9,20,0.45);
+    font-family:var(--font-title); font-weight:700; font-size:19px; letter-spacing:1px; margin-right:auto;
+    background:linear-gradient(135deg, var(--gold-2), var(--gold));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    text-shadow: 0 0 24px rgba(232,189,85,0.3);
   }
   main { max-width:1000px; margin:36px auto; padding:0 22px 70px; }
   h1 { font-family:var(--font-title); font-size:28px; margin:0 0 6px; font-weight:800; letter-spacing:.2px; }
@@ -246,22 +247,22 @@ STYLE = """
     transition: border-color .15s ease, box-shadow .15s ease;
   }
   input:focus, select:focus {
-    outline:none; border-color: var(--gold); box-shadow:0 0 0 3px rgba(229,9,20,0.18);
+    outline:none; border-color: var(--gold); box-shadow:0 0 0 3px rgba(232,189,85,0.15);
   }
   button {
-    background:var(--gold);
-    color:#fff; border:none; font-weight:700; cursor:pointer;
+    background:linear-gradient(135deg, var(--gold-2), var(--gold));
+    color:#1b1406; border:none; font-weight:700; cursor:pointer;
     padding:12px 20px; letter-spacing:.2px; border-radius:8px;
-    box-shadow: 0 6px 16px -6px rgba(229,9,20,0.55);
+    box-shadow: 0 6px 16px -6px rgba(232,189,85,0.5);
     transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
   }
-  button:hover { transform:translateY(-1px); filter:brightness(1.12); box-shadow:0 10px 22px -6px rgba(229,9,20,0.65); }
+  button:hover { transform:translateY(-1px); filter:brightness(1.05); box-shadow:0 10px 20px -6px rgba(232,189,85,0.6); }
   button:active { transform:translateY(0); }
   button.danger {
-    background:#7a0d12; color:#fff;
-    box-shadow: 0 6px 16px -6px rgba(122,13,18,0.6);
+    background:linear-gradient(135deg, #ef6b67, var(--red)); color:#fff;
+    box-shadow: 0 6px 16px -6px rgba(239,90,86,0.5);
   }
-  button.danger:hover { filter:brightness(1.25); box-shadow:0 10px 20px -6px rgba(122,13,18,0.7); }
+  button.danger:hover { filter:brightness(1.1); box-shadow:0 10px 20px -6px rgba(239,90,86,0.6); }
   button.secondary {
     background:var(--panel-2); color:var(--text); border:1px solid var(--border);
     box-shadow:none;
@@ -277,8 +278,8 @@ STYLE = """
   .badge.malgache { background:rgba(126,200,227,0.14); color:#7ec8e3; }
   .badge.instructeur { background:rgba(95,208,176,0.14); color:#5fd0b0; }
   .badge.proprietaire {
-    background:linear-gradient(135deg, rgba(229,9,20,0.25), rgba(229,9,20,0.1));
-    color:#ff525f; border:1px solid rgba(229,9,20,0.5);
+    background:linear-gradient(135deg, rgba(255,209,102,0.2), rgba(255,209,102,0.08));
+    color:#ffd166; border:1px solid rgba(255,209,102,0.5);
   }
   form.inline { display:inline; }
   .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
@@ -298,7 +299,7 @@ STYLE = """
     transition: transform .15s ease, border-color .15s ease;
   }
   .stat-card:hover { transform:translateY(-2px); border-color:rgba(229,9,20,0.45); }
-  .stat-card .valeur { font-family:var(--font-title); font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; text-shadow:0 0 18px rgba(229,9,20,0.3); }
+  .stat-card .valeur { font-family:var(--font-title); font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; text-shadow:0 0 18px rgba(232,189,85,0.2); }
   .stat-card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-top:4px; }
 
   .log-entry {
@@ -430,7 +431,7 @@ def page_html(titre, corps, connecte=None, role=None):
 <title>{titre} — Valerius</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚖️%3C/text%3E%3C/svg%3E">
 {STYLE}
 </head>
