@@ -314,34 +314,89 @@ STYLE = """
   .pill.on { background:rgba(63,214,140,0.14); color:#8bf0c0; }
   .pill.off { background:rgba(229,9,20,0.16); color:#ff9da1; }
 
-  .curseur-carre {
-    position: fixed; width: 7px; height: 7px;
-    background: var(--gold);
-    pointer-events: none; z-index: 9999;
-    border-radius: 2px;
-    transform: translate(-50%, -50%) rotate(45deg) scale(1);
-    box-shadow: 0 0 8px rgba(229,9,20,0.75);
-    animation: curseur-disparition .75s ease-out forwards;
+  #grille-curseur {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    display: grid;
   }
-  @keyframes curseur-disparition {
-    0%   { opacity: .95; transform: translate(-50%, -50%) rotate(45deg) scale(1); }
-    100% { opacity: 0;   transform: translate(-50%, -50%) rotate(45deg) scale(.25); }
+  .grille-case {
+    border: 1px solid rgba(229,9,20,0.05);
+    background: transparent;
+    transition: background .5s ease, border-color .5s ease, box-shadow .5s ease;
   }
+  .grille-case.actif {
+    background: rgba(229,9,20,0.4);
+    border-color: rgba(229,9,20,0.75);
+    box-shadow: 0 0 14px rgba(229,9,20,0.5) inset;
+    transition: background .06s ease, border-color .06s ease, box-shadow .06s ease;
+  }
+  nav, main { position: relative; z-index: 1; }
 </style>
 <script>
 (function () {
-  var dernier = 0;
-  document.addEventListener("mousemove", function (e) {
-    var maintenant = Date.now();
-    if (maintenant - dernier < 35) return;
-    dernier = maintenant;
-    var carre = document.createElement("div");
-    carre.className = "curseur-carre";
-    carre.style.left = e.clientX + "px";
-    carre.style.top = e.clientY + "px";
-    document.body.appendChild(carre);
-    setTimeout(function () { carre.remove(); }, 750);
-  }, { passive: true });
+  var TAILLE_CASE = 46;
+  var conteneur, cases = [], colonnes = 0, lignes = 0, actives = [];
+
+  function construireGrille() {
+    var largeur = window.innerWidth, hauteur = window.innerHeight;
+    colonnes = Math.ceil(largeur / TAILLE_CASE);
+    lignes = Math.ceil(hauteur / TAILLE_CASE);
+    conteneur.style.gridTemplateColumns = "repeat(" + colonnes + ", 1fr)";
+    conteneur.style.gridTemplateRows = "repeat(" + lignes + ", 1fr)";
+    conteneur.innerHTML = "";
+    cases = new Array(colonnes * lignes);
+    var fragment = document.createDocumentFragment();
+    for (var i = 0; i < colonnes * lignes; i++) {
+      var c = document.createElement("div");
+      c.className = "grille-case";
+      cases[i] = c;
+      fragment.appendChild(c);
+    }
+    conteneur.appendChild(fragment);
+    actives = [];
+  }
+
+  function allumer(index) {
+    if (index >= 0 && index < cases.length) {
+      cases[index].classList.add("actif");
+      actives.push(index);
+    }
+  }
+
+  function surMouvement(e) {
+    if (!colonnes || !lignes) return;
+    var col = Math.floor(e.clientX / (window.innerWidth / colonnes));
+    var lig = Math.floor(e.clientY / (window.innerHeight / lignes));
+    col = Math.max(0, Math.min(colonnes - 1, col));
+    lig = Math.max(0, Math.min(lignes - 1, lig));
+
+    actives.forEach(function (i) { if (cases[i]) cases[i].classList.remove("actif"); });
+    actives = [];
+
+    var centre = lig * colonnes + col;
+    allumer(centre);
+    if (col > 0) allumer(centre - 1);
+    if (col < colonnes - 1) allumer(centre + 1);
+    if (lig > 0) allumer(centre - colonnes);
+    if (lig < lignes - 1) allumer(centre + colonnes);
+  }
+
+  function init() {
+    conteneur = document.getElementById("grille-curseur");
+    if (!conteneur) return;
+    construireGrille();
+    document.addEventListener("mousemove", surMouvement, { passive: true });
+    var redim;
+    window.addEventListener("resize", function () {
+      clearTimeout(redim);
+      redim = setTimeout(construireGrille, 200);
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();
 </script>
 """
@@ -381,6 +436,7 @@ def page_html(titre, corps, connecte=None, role=None):
 {STYLE}
 </head>
 <body>
+<div id="grille-curseur"></div>
 <nav><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
 <main>
 {corps}
