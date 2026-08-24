@@ -178,19 +178,19 @@ STYLE = """
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0f1015;
-    --bg-soft: #14151c;
-    --panel: #1b1c25;
-    --panel-2: #21222c;
-    --border: #2c2d3a;
-    --text: #edeef5;
-    --muted: #9294ab;
-    --gold: #e8bd55;
-    --gold-2: #f4d485;
-    --red: #ef5a56;
+    --bg: #060608;
+    --bg-soft: #0d0d11;
+    --panel: #161619;
+    --panel-2: #1e1e22;
+    --border: #2b2b30;
+    --text: #f2f2f4;
+    --muted: #94949c;
+    --gold: #e50914;
+    --gold-2: #ff2d3e;
+    --red: #e50914;
     --green: #3fd68c;
-    --shadow: 0 10px 30px -12px rgba(0,0,0,0.55);
-    --font-title: "Cinzel", "Segoe UI", serif;
+    --shadow: 0 10px 30px -12px rgba(0,0,0,0.7);
+    --font-title: "Poppins", "Segoe UI", sans-serif;
     --font-body: "Inter", "Segoe UI", -apple-system, Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
@@ -198,81 +198,77 @@ STYLE = """
   body {
     margin:0; font-family:var(--font-body);
     background:
-      radial-gradient(1200px 600px at 15% -10%, rgba(232,189,85,0.10), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(79,140,214,0.07), transparent 55%),
-      radial-gradient(800px 500px at 50% 100%, rgba(232,189,85,0.05), transparent 60%),
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cg fill='none' stroke='%23e8bd55' stroke-width='1' opacity='0.05'%3E%3Ccircle cx='90' cy='90' r='60'/%3E%3Cpath d='M90 25 L101 79 L155 90 L101 101 L90 155 L79 101 L25 90 L79 79 Z'/%3E%3C/g%3E%3C/svg%3E"),
+      radial-gradient(1100px 550px at 15% -10%, rgba(229,9,20,0.16), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(229,9,20,0.08), transparent 55%),
       var(--bg);
-    background-attachment: fixed, fixed, fixed, fixed, fixed;
-    background-size: auto, auto, auto, 180px 180px, auto;
+    background-attachment: fixed, fixed, fixed;
     color:var(--text); min-height:100vh; line-height:1.5;
     animation: fade-in .35s ease;
   }
   @keyframes fade-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
   nav {
     display:flex; align-items:center; gap:22px; padding:16px 28px;
-    background:rgba(20,21,28,0.75); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    background:rgba(6,6,8,0.82); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
     border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10;
-    box-shadow: 0 4px 24px -10px rgba(0,0,0,0.6);
+    box-shadow: 0 4px 24px -10px rgba(0,0,0,0.75);
   }
   nav a {
-    color:var(--muted); text-decoration:none; font-size:14px; font-weight:500;
+    color:var(--muted); text-decoration:none; font-size:14px; font-weight:600;
     padding:7px 12px; border-radius:8px; transition:all .15s ease;
   }
   nav a:hover { color:#fff; background:var(--panel-2); }
   nav .brand {
-    font-family:var(--font-title); font-weight:700; font-size:18px; letter-spacing:1px; margin-right:auto;
-    background:linear-gradient(135deg, var(--gold-2), var(--gold));
-    -webkit-background-clip:text; background-clip:text; color:transparent;
-    text-shadow: 0 0 24px rgba(232,189,85,0.25);
+    font-family:var(--font-title); font-weight:800; font-size:19px; letter-spacing:.5px; margin-right:auto;
+    color:var(--gold); text-transform:uppercase;
+    text-shadow: 0 0 24px rgba(229,9,20,0.45);
   }
   main { max-width:1000px; margin:36px auto; padding:0 22px 70px; }
-  h1 { font-family:var(--font-title); font-size:28px; margin:0 0 6px; font-weight:700; letter-spacing:.3px; }
-  h2 { font-family:var(--font-title); font-size:18px; color:#d7d8e6; margin-top:34px; margin-bottom:10px; font-weight:700; letter-spacing:.2px; }
+  h1 { font-family:var(--font-title); font-size:28px; margin:0 0 6px; font-weight:800; letter-spacing:.2px; }
+  h2 { font-family:var(--font-title); font-size:18px; color:#e4e4e8; margin-top:34px; margin-bottom:10px; font-weight:700; letter-spacing:.2px; }
   .card {
     position:relative; overflow:hidden;
     background:linear-gradient(180deg, var(--panel), var(--panel) 60%, var(--panel-2));
-    border:1px solid var(--border); border-radius:16px; padding:22px 24px; margin:16px 0;
+    border:1px solid var(--border); border-radius:14px; padding:22px 24px; margin:16px 0;
     box-shadow: var(--shadow); transition: border-color .2s ease, transform .15s ease, box-shadow .2s ease;
   }
   .card::before {
-    content:""; position:absolute; inset:0 0 auto 0; height:1px;
-    background:linear-gradient(90deg, transparent, rgba(232,189,85,0.5), transparent);
+    content:""; position:absolute; inset:0 0 auto 0; height:2px;
+    background:linear-gradient(90deg, transparent, rgba(229,9,20,0.6), transparent);
   }
-  .card:hover { border-color:#3a3c4c; box-shadow: 0 14px 34px -12px rgba(0,0,0,0.65); }
+  .card:hover { border-color:#3a3a40; transform:translateY(-2px); box-shadow: 0 16px 36px -12px rgba(0,0,0,0.8); }
   table { width:100%; border-collapse:collapse; margin-top:10px; }
   th, td { text-align:left; padding:12px 14px; border-bottom:1px solid var(--border); font-size:14px; vertical-align:middle; }
   th { color:var(--muted); font-weight:700; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
-  tr:hover td { background:rgba(255,255,255,0.02); }
+  tr:hover td { background:rgba(255,255,255,0.025); }
   input, select, button {
-    font-family:inherit; font-size:14px; padding:11px 15px; border-radius:10px;
+    font-family:inherit; font-size:14px; padding:11px 15px; border-radius:8px;
     border:1px solid var(--border); background:var(--bg-soft); color:var(--text);
     transition: border-color .15s ease, box-shadow .15s ease;
   }
   input:focus, select:focus {
-    outline:none; border-color: var(--gold); box-shadow:0 0 0 3px rgba(232,189,85,0.15);
+    outline:none; border-color: var(--gold); box-shadow:0 0 0 3px rgba(229,9,20,0.18);
   }
   button {
-    background:linear-gradient(135deg, var(--gold-2), var(--gold));
-    color:#1b1406; border:none; font-weight:700; cursor:pointer;
-    padding:12px 20px; letter-spacing:.2px;
-    box-shadow: 0 6px 16px -6px rgba(232,189,85,0.5);
+    background:var(--gold);
+    color:#fff; border:none; font-weight:700; cursor:pointer;
+    padding:12px 20px; letter-spacing:.2px; border-radius:8px;
+    box-shadow: 0 6px 16px -6px rgba(229,9,20,0.55);
     transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
   }
-  button:hover { transform:translateY(-1px); filter:brightness(1.05); box-shadow:0 10px 20px -6px rgba(232,189,85,0.6); }
+  button:hover { transform:translateY(-1px); filter:brightness(1.12); box-shadow:0 10px 22px -6px rgba(229,9,20,0.65); }
   button:active { transform:translateY(0); }
   button.danger {
-    background:linear-gradient(135deg, #ef6b67, var(--red)); color:#fff;
-    box-shadow: 0 6px 16px -6px rgba(239,90,86,0.5);
+    background:#7a0d12; color:#fff;
+    box-shadow: 0 6px 16px -6px rgba(122,13,18,0.6);
   }
-  button.danger:hover { box-shadow:0 10px 20px -6px rgba(239,90,86,0.6); }
+  button.danger:hover { filter:brightness(1.25); box-shadow:0 10px 20px -6px rgba(122,13,18,0.7); }
   button.secondary {
     background:var(--panel-2); color:var(--text); border:1px solid var(--border);
     box-shadow:none;
   }
-  button.secondary:hover { background:#2a2c38; box-shadow:none; }
-  .flash { padding:13px 16px; border-radius:12px; margin-bottom:16px; font-size:14px; font-weight:500; border:1px solid transparent; }
-  .flash.erreur { background:rgba(239,90,86,0.12); color:#ff9d9d; border-color:rgba(239,90,86,0.35); }
+  button.secondary:hover { background:#2a2a30; box-shadow:none; }
+  .flash { padding:13px 16px; border-radius:10px; margin-bottom:16px; font-size:14px; font-weight:500; border:1px solid transparent; }
+  .flash.erreur { background:rgba(229,9,20,0.14); color:#ff9da1; border-color:rgba(229,9,20,0.4); }
   .flash.ok { background:rgba(63,214,140,0.1); color:#8bf0c0; border-color:rgba(63,214,140,0.3); }
   .badge {
     display:inline-flex; align-items:center; padding:4px 12px; border-radius:20px;
@@ -281,28 +277,28 @@ STYLE = """
   .badge.malgache { background:rgba(126,200,227,0.14); color:#7ec8e3; }
   .badge.instructeur { background:rgba(95,208,176,0.14); color:#5fd0b0; }
   .badge.proprietaire {
-    background:linear-gradient(135deg, rgba(255,209,102,0.2), rgba(255,209,102,0.08));
-    color:#ffd166; border:1px solid rgba(255,209,102,0.5);
+    background:linear-gradient(135deg, rgba(229,9,20,0.25), rgba(229,9,20,0.1));
+    color:#ff525f; border:1px solid rgba(229,9,20,0.5);
   }
   form.inline { display:inline; }
   .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
   .muted { color:var(--muted); font-size:13px; }
   a.btnlink {
-    display:inline-flex; align-items:center; gap:6px; padding:11px 18px; border-radius:10px;
+    display:inline-flex; align-items:center; gap:6px; padding:11px 18px; border-radius:8px;
     background:var(--panel-2); border:1px solid var(--border); color:var(--text);
     text-decoration:none; font-size:14px; font-weight:600;
     transition: all .15s ease;
   }
-  a.btnlink:hover { background:#2a2c38; border-color:#3a3c4c; transform:translateY(-1px); }
+  a.btnlink:hover { background:#2a2a30; border-color:#3a3a40; transform:translateY(-1px); }
 
   .stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:14px; margin:16px 0; }
   .stat-card {
     background:linear-gradient(180deg, var(--panel), var(--panel-2));
-    border:1px solid var(--border); border-radius:14px; padding:18px 20px; box-shadow:var(--shadow);
+    border:1px solid var(--border); border-radius:12px; padding:18px 20px; box-shadow:var(--shadow);
     transition: transform .15s ease, border-color .15s ease;
   }
-  .stat-card:hover { transform:translateY(-2px); border-color:rgba(232,189,85,0.4); }
-  .stat-card .valeur { font-family:var(--font-title); font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; text-shadow:0 0 18px rgba(232,189,85,0.2); }
+  .stat-card:hover { transform:translateY(-2px); border-color:rgba(229,9,20,0.45); }
+  .stat-card .valeur { font-family:var(--font-title); font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; text-shadow:0 0 18px rgba(229,9,20,0.3); }
   .stat-card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-top:4px; }
 
   .log-entry {
@@ -310,14 +306,44 @@ STYLE = """
     font-size:13.5px; align-items:flex-start;
   }
   .log-entry:last-child { border-bottom:none; }
-  .log-entry:hover { background:rgba(255,255,255,0.02); }
+  .log-entry:hover { background:rgba(255,255,255,0.025); }
   .log-entry .date { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; min-width:150px; }
   .log-entry .texte { color:#dcdde8; word-break:break-word; }
 
   .pill { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:20px; font-size:12px; font-weight:700; }
   .pill.on { background:rgba(63,214,140,0.14); color:#8bf0c0; }
-  .pill.off { background:rgba(239,90,86,0.14); color:#ff9d9d; }
+  .pill.off { background:rgba(229,9,20,0.16); color:#ff9da1; }
+
+  .curseur-carre {
+    position: fixed; width: 7px; height: 7px;
+    background: var(--gold);
+    pointer-events: none; z-index: 9999;
+    border-radius: 2px;
+    transform: translate(-50%, -50%) rotate(45deg) scale(1);
+    box-shadow: 0 0 8px rgba(229,9,20,0.75);
+    animation: curseur-disparition .75s ease-out forwards;
+  }
+  @keyframes curseur-disparition {
+    0%   { opacity: .95; transform: translate(-50%, -50%) rotate(45deg) scale(1); }
+    100% { opacity: 0;   transform: translate(-50%, -50%) rotate(45deg) scale(.25); }
+  }
 </style>
+<script>
+(function () {
+  var dernier = 0;
+  document.addEventListener("mousemove", function (e) {
+    var maintenant = Date.now();
+    if (maintenant - dernier < 35) return;
+    dernier = maintenant;
+    var carre = document.createElement("div");
+    carre.className = "curseur-carre";
+    carre.style.left = e.clientX + "px";
+    carre.style.top = e.clientY + "px";
+    document.body.appendChild(carre);
+    setTimeout(function () { carre.remove(); }, 750);
+  }, { passive: true });
+})();
+</script>
 """
 
 
@@ -350,7 +376,7 @@ def page_html(titre, corps, connecte=None, role=None):
 <title>{titre} — Valerius</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚖️%3C/text%3E%3C/svg%3E">
 {STYLE}
 </head>
@@ -1058,6 +1084,8 @@ def configurer_site(app, bot, deps):
                 nouveau_role = request.form.get("role", "")
                 nouveau_guild = request.form.get("guild_id", "").strip()
                 nouveau_discord_id = request.form.get("discord_id", "").strip()
+                nouveau_login = request.form.get("nouveau_login", "").strip()
+                nouveau_mdp = request.form.get("nouveau_mdp", "")
                 cible = comptes.get(login)
                 if not cible:
                     erreur = "Compte introuvable."
@@ -1069,12 +1097,25 @@ def configurer_site(app, bot, deps):
                     erreur = "Tu ne peux pas attribuer ce rôle."
                 elif login == COMPTE_PROPRIETAIRE_LOGIN and nouveau_role != "proprietaire":
                     erreur = "Le compte propriétaire historique doit toujours rester Propriétaire."
+                elif acteur_super and nouveau_login and nouveau_login != login and login == COMPTE_PROPRIETAIRE_LOGIN:
+                    erreur = "Impossible de renommer le compte propriétaire historique."
+                elif acteur_super and nouveau_login and nouveau_login != login and nouveau_login in comptes:
+                    erreur = "Cet identifiant est déjà pris."
+                elif acteur_super and nouveau_mdp and len(nouveau_mdp) < 6:
+                    erreur = "Le nouveau mot de passe doit faire au moins 6 caractères."
                 else:
                     if not acteur_super:
                         nouveau_guild = acteur.get("guild_id")
                     cible["role"] = nouveau_role
                     cible["guild_id"] = nouveau_guild or None
                     cible["discord_id"] = nouveau_discord_id or None
+                    if acteur_super and nouveau_mdp:
+                        cible["password_hash"] = generate_password_hash(nouveau_mdp)
+                        cible["must_change_password"] = False
+                    if acteur_super and nouveau_login and nouveau_login != login:
+                        del comptes[login]
+                        comptes[nouveau_login] = cible
+                        login = nouveau_login
                     sauvegarder_comptes(comptes)
                     message = f"Compte « {login} » mis à jour."
 
@@ -1123,6 +1164,7 @@ def configurer_site(app, bot, deps):
           <p class="muted">Le mot de passe temporaire s'affiche une seule fois après la création — il devra être changé à la première connexion.</p>
         </div>
 
+        {% if acteur_super %}<p class="muted">En tant que Propriétaire, tu peux tout modifier sur un compte (identifiant, mot de passe, rôle, ID Discord, serveur) directement depuis la colonne « Modifier ». Laisse un champ vide pour ne pas le changer.</p>{% endif %}
         <table>
           <tr><th>Identifiant</th><th>Rôle</th><th>Discord ID</th><th>Serveur</th><th>Modifier</th><th>Actions</th></tr>
           {% for login, c, nom_serveur in lignes_comptes %}
@@ -1143,6 +1185,8 @@ def configurer_site(app, bot, deps):
                 </select>
                 <input name="discord_id" value="{{ c.discord_id or '' }}" placeholder="ID Discord" style="width:130px">
                 {% if acteur_super %}
+                <input name="nouveau_login" placeholder="Nouvel identifiant" style="width:140px">
+                <input name="nouveau_mdp" placeholder="Nouveau mot de passe" style="width:150px">
                 <select name="guild_id">
                   <option value="">— Aucun —</option>
                   {% for g in guilds %}
