@@ -39,7 +39,7 @@ import json
 import secrets
 import functools
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from flask import request, redirect, url_for, session, send_file, abort, render_template_string
@@ -47,6 +47,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 COMPTES_FILE = "valerius_comptes.json"
 SECRET_KEY_FILE = "valerius_secret.key"
+TENTATIVES_FILE = "valerius_tentatives_connexion.json"
 COMPTE_PROPRIETAIRE_LOGIN = "MAVIE7620"
 
 ROLES_ORDRE = ["malgache", "instructeur", "proprietaire"]
@@ -55,6 +56,20 @@ ROLE_LABELS = {
     "instructeur": "Instructeur",
     "proprietaire": "Propriétaire",
 }
+
+# ================= SÉCURITÉ : ANTI BRUTE-FORCE & HISTORIQUE =================
+MAX_TENTATIVES_CONNEXION = 6
+FENETRE_TENTATIVES = timedelta(minutes=10)
+DUREE_BLOCAGE_CONNEXION = timedelta(minutes=15)
+MAX_HISTORIQUE_CONNEXIONS = 20
+
+# ================= CONFIRMATION PAR MP DISCORD (actions sensibles) =================
+# Token -> {"code", "login_acteur", "expire", "description", "donnees_action"}.
+# Volontairement en mémoire (non persisté) : une confirmation en attente
+# n'a pas besoin de survivre à un redémarrage, elle expire en quelques
+# minutes de toute façon.
+CONFIRMATIONS_EN_ATTENTE = {}
+DUREE_VALIDITE_CONFIRMATION = timedelta(minutes=5)
 
 
 def niveau_role(role):
@@ -126,6 +141,78 @@ def sauvegarder_comptes(comptes):
 
 def _generer_mot_de_passe():
     return secrets.token_urlsafe(9)
+
+
+def _obtenir_ip_visiteur():
+    """Adresse IP du visiteur. Render (comme la plupart des hébergeurs)
+    place le site derrière un proxy : la vraie IP arrive dans l'en-tête
+    X-Forwarded-For (la première de la liste), pas dans remote_addr."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "inconnue"
+
+
+def _charger_tentatives():
+    if not os.path.exists(TENTATIVES_FILE):
+        return {}
+    try:
+        with open(TENTATIVES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _sauvegarder_tentatives(tentatives):
+    with open(TENTATIVES_FILE, "w", encoding="utf-8") as f:
+        json.dump(tentatives, f, ensure_ascii=False)
+
+
+def _ip_bloquee(ip):
+    """Renvoie le nombre de secondes restantes si cette IP est actuellement
+    bloquée pour trop de tentatives de connexion échouées, sinon None."""
+    info = _charger_tentatives().get(ip)
+    if not info or not info.get("bloque_jusqu"):
+        return None
+    bloque_jusqu = datetime.fromisoformat(info["bloque_jusqu"])
+    if datetime.now() >= bloque_jusqu:
+        return None
+    return int((bloque_jusqu - datetime.now()).total_seconds())
+
+
+def _enregistrer_echec_connexion(ip):
+    """Incrémente le compteur d'échecs pour cette IP (fenêtre glissante de
+    FENETRE_TENTATIVES) et déclenche un blocage temporaire au-delà de
+    MAX_TENTATIVES_CONNEXION. Renvoie l'état à jour pour cette IP."""
+    tentatives = _charger_tentatives()
+    info = tentatives.get(ip, {"echecs": 0, "premiere_tentative": None, "bloque_jusqu": None})
+    maintenant = datetime.now()
+    premiere = datetime.fromisoformat(info["premiere_tentative"]) if info.get("premiere_tentative") else None
+    if not premiere or maintenant - premiere > FENETRE_TENTATIVES:
+        info = {"echecs": 1, "premiere_tentative": maintenant.isoformat(), "bloque_jusqu": None}
+    else:
+        info["echecs"] = info.get("echecs", 0) + 1
+    if info["echecs"] >= MAX_TENTATIVES_CONNEXION:
+        info["bloque_jusqu"] = (maintenant + DUREE_BLOCAGE_CONNEXION).isoformat()
+    tentatives[ip] = info
+    _sauvegarder_tentatives(tentatives)
+    return info
+
+
+def _reinitialiser_tentatives(ip):
+    tentatives = _charger_tentatives()
+    if ip in tentatives:
+        del tentatives[ip]
+        _sauvegarder_tentatives(tentatives)
+
+
+def _enregistrer_connexion_reussie(compte, ip):
+    """Ajoute une entrée à l'historique de connexions du compte (affiché
+    dans « Mon profil »), la plus récente en premier, limité aux
+    MAX_HISTORIQUE_CONNEXIONS dernières entrées."""
+    historique = compte.setdefault("historique_connexions", [])
+    historique.insert(0, {"date": datetime.now().strftime("%d/%m/%Y à %H:%M:%S"), "ip": ip})
+    del historique[MAX_HISTORIQUE_CONNEXIONS:]
 
 
 async def initialiser_compte_proprietaire(envoyer_log_proprietaire, bot):
@@ -818,17 +905,35 @@ def configurer_site(app, bot, deps):
     def connexion():
         erreur = None
         if request.method == "POST":
-            login = request.form.get("login", "").strip()
-            mdp = request.form.get("mot_de_passe", "")
-            compte = charger_comptes().get(login)
-            if compte and check_password_hash(compte["password_hash"], mdp):
-                session.clear()
-                session["login"] = login
-                session.permanent = True
-                if compte.get("must_change_password"):
-                    return redirect(url_for("changer_mot_de_passe"))
-                return redirect(url_for("racine"))
-            erreur = "Identifiant ou mot de passe incorrect."
+            ip = _obtenir_ip_visiteur()
+            secondes_restantes = _ip_bloquee(ip)
+            if secondes_restantes:
+                minutes_restantes = max(1, -(-secondes_restantes // 60))
+                erreur = (f"Trop de tentatives échouées depuis cette adresse. "
+                          f"Réessaie dans environ {minutes_restantes} minute(s).")
+            else:
+                login = request.form.get("login", "").strip()
+                mdp = request.form.get("mot_de_passe", "")
+                comptes = charger_comptes()
+                compte = comptes.get(login)
+                if compte and check_password_hash(compte["password_hash"], mdp):
+                    _reinitialiser_tentatives(ip)
+                    _enregistrer_connexion_reussie(compte, ip)
+                    comptes[login] = compte
+                    sauvegarder_comptes(comptes)
+                    session.clear()
+                    session["login"] = login
+                    session.permanent = True
+                    if compte.get("must_change_password"):
+                        return redirect(url_for("changer_mot_de_passe"))
+                    return redirect(url_for("racine"))
+                info = _enregistrer_echec_connexion(ip)
+                deps["sauvegarder_log_disque"](f"⚠️ Tentative de connexion échouée pour « {login} » depuis {ip}.")
+                if info["echecs"] >= MAX_TENTATIVES_CONNEXION:
+                    erreur = (f"Trop de tentatives échouées. Cette adresse est bloquée "
+                              f"pendant {int(DUREE_BLOCAGE_CONNEXION.total_seconds() // 60)} minutes.")
+                else:
+                    erreur = "Identifiant ou mot de passe incorrect."
         corps = render_template_string("""
         <div class="card" style="max-width:360px;margin:60px auto;">
           <h1>Connexion</h1>
@@ -1340,12 +1445,60 @@ def configurer_site(app, bot, deps):
 
     # ---------- Admin : comptes du site (instructeur et plus) ----------
 
+    def _envoyer_code_confirmation(acteur, description, donnees_action):
+        """Génère un code de confirmation à 6 chiffres pour une action
+        sensible (suppression de compte, changement de rôle) et l'envoie
+        par MP Discord à l'acteur — celui qui vient de déclencher l'action,
+        pas la cible. Renvoie le token à valider ensuite via l'action
+        "confirmer", ou None si l'envoi n'a pas pu avoir lieu (pas de
+        compte Discord relié à l'acteur, DM impossible...) — l'appelant
+        doit alors refuser l'action plutôt que de l'exécuter sans confirmation."""
+        discord_id = acteur.get("discord_id")
+        if not discord_id:
+            return None
+        try:
+            discord_id_int = int(discord_id)
+        except (TypeError, ValueError):
+            return None
+
+        code = f"{secrets.randbelow(1000000):06d}"
+        token = secrets.token_urlsafe(16)
+
+        async def _envoyer():
+            utilisateur = bot.get_user(discord_id_int) or await bot.fetch_user(discord_id_int)
+            await utilisateur.send(
+                "🔐 **Confirmation requise — Site Valerius**\n"
+                f"{description}\n"
+                f"Code de confirmation : `{code}`\n"
+                "⚠️ Valable 5 minutes. Si tu n'es pas à l'origine de cette action, "
+                "ignore ce message et préviens un propriétaire."
+            )
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_envoyer(), bot.loop)
+            future.result(timeout=10)
+        except Exception:
+            return None
+
+        for tok in [t for t, info in CONFIRMATIONS_EN_ATTENTE.items() if info["expire"] < datetime.now()]:
+            del CONFIRMATIONS_EN_ATTENTE[tok]
+
+        CONFIRMATIONS_EN_ATTENTE[token] = {
+            "code": code,
+            "login_acteur": connecte(),
+            "expire": datetime.now() + DUREE_VALIDITE_CONFIRMATION,
+            "description": description,
+            "donnees_action": donnees_action,
+        }
+        return token
+
     @app.route("/admin/comptes", methods=["GET", "POST"])
     @role_required("instructeur")
     def admin_comptes():
         message = None
         erreur = None
         mot_de_passe_genere = None
+        confirmation_en_attente = None
         acteur = compte_connecte()
         acteur_role = acteur.get("role")
         # Seul un Propriétaire a le pouvoir total : attribuer n'importe quel
@@ -1359,6 +1512,44 @@ def configurer_site(app, bot, deps):
 
         def peut_attribuer(role_demande):
             return acteur_super or niveau_role(role_demande) < niveau_role(acteur_role)
+
+        def _executer_suppression(login_cible):
+            """Exécute réellement la suppression, après confirmation MP."""
+            comptes_locaux = charger_comptes()
+            if login_cible in comptes_locaux:
+                del comptes_locaux[login_cible]
+                sauvegarder_comptes(comptes_locaux)
+                deps["sauvegarder_log_disque"](f"🗑️ Compte « {login_cible} » supprimé (confirmé par MP) par {connecte()}.")
+
+        def _executer_modification(donnees):
+            """Exécute réellement la modification (dont le changement de
+            rôle), après confirmation MP. Reprend exactement la logique de
+            la branche "modifier" d'origine."""
+            comptes_locaux = charger_comptes()
+            login_cible = donnees["login"]
+            cible = comptes_locaux.get(login_cible)
+            if not cible:
+                return
+            role_avant = cible.get("role")
+            nouveau_guild = donnees["nouveau_guild"]
+            if not donnees["acteur_super"]:
+                nouveau_guild = donnees["acteur_guild"]
+            cible["role"] = donnees["nouveau_role"]
+            cible["guild_id"] = nouveau_guild or None
+            cible["discord_id"] = donnees["nouveau_discord_id"] or None
+            if donnees["acteur_super"] and donnees["nouveau_mdp"]:
+                cible["password_hash"] = generate_password_hash(donnees["nouveau_mdp"])
+                cible["must_change_password"] = False
+            if donnees["acteur_super"] and donnees["nouveau_login"] and donnees["nouveau_login"] != login_cible:
+                del comptes_locaux[login_cible]
+                comptes_locaux[donnees["nouveau_login"]] = cible
+                login_cible = donnees["nouveau_login"]
+            sauvegarder_comptes(comptes_locaux)
+            deps["sauvegarder_log_disque"](
+                f"🛡️ Rôle de « {login_cible} » changé : {ROLE_LABELS.get(role_avant, role_avant)} → "
+                f"{ROLE_LABELS.get(donnees['nouveau_role'], donnees['nouveau_role'])} (confirmé par MP) par {connecte()}."
+            )
+            return login_cible
 
         if request.method == "POST":
             action = request.form.get("action")
@@ -1390,6 +1581,8 @@ def configurer_site(app, bot, deps):
                     message = f"Compte « {login} » créé."
 
             elif action == "supprimer":
+                # Action sensible : ne s'exécute pas immédiatement, un code
+                # de confirmation est d'abord envoyé par MP Discord à l'acteur.
                 login = request.form.get("login")
                 cible = comptes.get(login)
                 if login == COMPTE_PROPRIETAIRE_LOGIN:
@@ -1399,9 +1592,17 @@ def configurer_site(app, bot, deps):
                 elif not peut_gerer(cible.get("role")):
                     erreur = "Tu n'as pas l'autorité pour supprimer ce compte."
                 else:
-                    del comptes[login]
-                    sauvegarder_comptes(comptes)
-                    message = "Compte supprimé."
+                    token = _envoyer_code_confirmation(
+                        acteur, f"Confirmer la suppression du compte « {login} ».",
+                        {"type": "supprimer", "login": login}
+                    )
+                    if not token:
+                        erreur = ("Action sensible : la suppression d'un compte nécessite une confirmation "
+                                  "par MP Discord, mais ton propre compte n'a pas d'ID Discord relié pour la recevoir. "
+                                  "Demande à un Propriétaire de l'ajouter dans « Comptes ».")
+                    else:
+                        confirmation_en_attente = {"token": token, "description": f"Suppression du compte « {login} »"}
+                        message = "Un code de confirmation vient d'être envoyé par MP Discord. Entre-le ci-dessous pour valider l'action."
 
             elif action == "reinitialiser":
                 login = request.form.get("login")
@@ -1445,6 +1646,30 @@ def configurer_site(app, bot, deps):
                     erreur = "Cet identifiant est déjà pris."
                 elif acteur_super and nouveau_mdp and len(nouveau_mdp) < 6:
                     erreur = "Le nouveau mot de passe doit faire au moins 6 caractères."
+                elif nouveau_role != cible.get("role"):
+                    # Changement de rôle : action sensible, confirmation par
+                    # MP Discord requise avant application (les autres champs
+                    # modifiés dans la même soumission sont appliqués en même
+                    # temps, une fois le code confirmé).
+                    donnees_action = {
+                        "type": "modifier", "login": login, "nouveau_role": nouveau_role,
+                        "nouveau_guild": nouveau_guild, "nouveau_discord_id": nouveau_discord_id,
+                        "nouveau_login": nouveau_login, "nouveau_mdp": nouveau_mdp,
+                        "acteur_super": acteur_super, "acteur_guild": acteur.get("guild_id"),
+                    }
+                    token = _envoyer_code_confirmation(
+                        acteur,
+                        f"Confirmer le changement de rôle de « {login} » : "
+                        f"{ROLE_LABELS.get(cible.get('role'))} → {ROLE_LABELS.get(nouveau_role)}.",
+                        donnees_action
+                    )
+                    if not token:
+                        erreur = ("Action sensible : un changement de rôle nécessite une confirmation "
+                                  "par MP Discord, mais ton propre compte n'a pas d'ID Discord relié pour la recevoir. "
+                                  "Demande à un Propriétaire de l'ajouter dans « Comptes ».")
+                    else:
+                        confirmation_en_attente = {"token": token, "description": f"Changement de rôle de « {login} »"}
+                        message = "Un code de confirmation vient d'être envoyé par MP Discord. Entre-le ci-dessous pour valider l'action."
                 else:
                     if not acteur_super:
                         nouveau_guild = acteur.get("guild_id")
@@ -1460,6 +1685,29 @@ def configurer_site(app, bot, deps):
                         login = nouveau_login
                     sauvegarder_comptes(comptes)
                     message = f"Compte « {login} » mis à jour."
+
+            elif action == "confirmer":
+                # Validation du code de confirmation reçu par MP Discord
+                # pour une suppression de compte ou un changement de rôle.
+                token = request.form.get("token", "")
+                code_saisi = request.form.get("code", "").strip()
+                info = CONFIRMATIONS_EN_ATTENTE.get(token)
+                if not info or info["login_acteur"] != connecte():
+                    erreur = "Confirmation introuvable ou déjà utilisée. Relance l'action."
+                elif datetime.now() > info["expire"]:
+                    del CONFIRMATIONS_EN_ATTENTE[token]
+                    erreur = "Le code de confirmation a expiré. Relance l'action."
+                elif code_saisi != info["code"]:
+                    erreur = "Code incorrect."
+                else:
+                    donnees = info["donnees_action"]
+                    if donnees["type"] == "supprimer":
+                        _executer_suppression(donnees["login"])
+                        message = f"Compte « {donnees['login']} » supprimé."
+                    elif donnees["type"] == "modifier":
+                        login_final = _executer_modification(donnees)
+                        message = f"Compte « {login_final or donnees['login']} » mis à jour."
+                    del CONFIRMATIONS_EN_ATTENTE[token]
 
         comptes = charger_comptes()
         if not acteur_super:
@@ -1479,6 +1727,19 @@ def configurer_site(app, bot, deps):
         {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
         {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
         {% if mot_de_passe %}<div class="flash ok">Mot de passe temporaire (note-le, il ne sera plus jamais affiché) : <strong>{{ mot_de_passe }}</strong></div>{% endif %}
+
+        {% if confirmation_en_attente %}
+        <div class="card">
+          <h2 style="margin-top:0">🔐 Confirmation requise</h2>
+          <p class="muted">{{ confirmation_en_attente.description }} — un code à 6 chiffres vient d'être envoyé par MP Discord, valable 5 minutes.</p>
+          <form method="post" class="row">
+            <input type="hidden" name="action" value="confirmer">
+            <input type="hidden" name="token" value="{{ confirmation_en_attente.token }}">
+            <input name="code" placeholder="Code à 6 chiffres" maxlength="6" required style="flex:1;min-width:160px">
+            <button type="submit">Confirmer l'action</button>
+          </form>
+        </div>
+        {% endif %}
 
         <div class="card">
           <h2 style="margin-top:0">Créer un compte</h2>
@@ -1565,7 +1826,7 @@ def configurer_site(app, bot, deps):
              proprietaire=COMPTE_PROPRIETAIRE_LOGIN, guilds=guilds, roles_attribuables=roles_attribuables,
              role_labels=ROLE_LABELS, acteur_super=acteur_super, acteur_guild=acteur.get("guild_id"),
              nom_serveur_acteur=noms_guildes.get(str(acteur.get("guild_id"))), connecte_login=connecte(),
-             peut_gerer=peut_gerer)
+             peut_gerer=peut_gerer, confirmation_en_attente=confirmation_en_attente)
         return page_html("Comptes", corps, connecte(), acteur_role)
 
     # ---------- Admin : sauvegardes (proprietaire uniquement — accès total) ----------
@@ -1917,6 +2178,7 @@ def configurer_site(app, bot, deps):
         if discord_id and guild_id:
             profils = deps["charger_profils"](int(guild_id))
             profil = profils.get(str(discord_id))
+        historique_connexions = compte.get("historique_connexions", [])
         corps = render_template_string("""
         <h1>Mon profil</h1>
         {% if not profil %}
@@ -1939,7 +2201,22 @@ def configurer_site(app, bot, deps):
             {% endfor %}
           </table>
         {% endif %}
-        """, profil=profil)
+
+        <h2>Historique des connexions</h2>
+        <div class="card">
+          <p class="muted">Repère ici toute connexion suspecte à ton compte. Si tu ne reconnais pas une adresse, change ton mot de passe immédiatement.</p>
+          {% if not historique_connexions %}
+          <p class="muted">Aucune connexion précédente enregistrée.</p>
+          {% else %}
+          <table>
+            <tr><th>Date</th><th>Adresse IP</th></tr>
+            {% for h in historique_connexions %}
+            <tr><td>{{ h.date }}</td><td>{{ h.ip }}</td></tr>
+            {% endfor %}
+          </table>
+          {% endif %}
+        </div>
+        """, profil=profil, historique_connexions=historique_connexions)
         return page_html("Mon profil", corps, connecte(), compte.get("role"))
 
     @app.route("/mon-catalogue")

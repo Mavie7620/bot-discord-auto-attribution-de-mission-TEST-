@@ -1769,9 +1769,10 @@ def generer_backup_complet():
     import glob
     fichiers_txt = glob.glob("valerius_missions_*.txt")
     fichiers_json = glob.glob("valerius_profils_*.json")
-    # Le code d'activation et les comptes du site web doivent eux aussi
-    # survivre à un redémarrage sur Render (disque non-persistant).
-    for f_extra in (VERROU_FILE, site_web.COMPTES_FILE, site_web.SECRET_KEY_FILE):
+    # Le code d'activation, les comptes du site web et le compteur anti
+    # brute-force doivent eux aussi survivre à un redémarrage sur Render
+    # (disque non-persistant).
+    for f_extra in (VERROU_FILE, site_web.COMPTES_FILE, site_web.SECRET_KEY_FILE, site_web.TENTATIVES_FILE):
         if os.path.exists(f_extra):
             fichiers_json.append(f_extra)
 
