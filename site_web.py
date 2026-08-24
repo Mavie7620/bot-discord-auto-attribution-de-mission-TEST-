@@ -223,6 +223,8 @@ STYLE = """
     -webkit-background-clip:text; background-clip:text; color:transparent;
     text-shadow: 0 0 24px rgba(232,189,85,0.3);
   }
+  nav a.retour-pays { padding:7px 8px 7px 0; font-weight:600; }
+  nav .separateur-nav { color:var(--border); font-size:14px; margin-right:2px; }
   main { max-width:1000px; margin:36px auto; padding:0 22px 70px; }
   h1 { font-family:var(--font-title); font-size:28px; margin:0 0 6px; font-weight:800; letter-spacing:.2px; }
   h2 { font-family:var(--font-title); font-size:18px; color:#e4e4e8; margin-top:34px; margin-bottom:10px; font-weight:700; letter-spacing:.2px; }
@@ -437,10 +439,193 @@ def page_html(titre, corps, connecte=None, role=None):
 </head>
 <body>
 <div id="grille-curseur"></div>
-<nav><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
+<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar">🇲🇬 Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
 <main>
 {corps}
 </main>
+</body>
+</html>"""
+
+
+# ================= PORTAIL PAYS (page d'accueil "Madagascar") =================
+# Le site n'est plus directement "Valerius" : Valerius devient une zone parmi
+# d'autres, accessible depuis le portail du pays. D'autres zones pourront
+# être ajoutées simplement à la liste ZONES_PAYS ci-dessous.
+
+ZONES_PAYS = [
+    {
+        "id": "valerius",
+        "nom": "Valerius",
+        "icone": "⚖️",
+        "description": "Système d'attribution de missions et de gestion administrative.",
+        "url": "/valerius",
+        "disponible": True,
+    },
+    {
+        "id": "zone-2",
+        "nom": "???",
+        "icone": "🔒",
+        "description": "Zone en préparation.",
+        "url": None,
+        "disponible": False,
+    },
+    {
+        "id": "zone-3",
+        "nom": "???",
+        "icone": "🔒",
+        "description": "Zone en préparation.",
+        "url": None,
+        "disponible": False,
+    },
+]
+
+STYLE_PAYS = """
+<style>
+  .pays-body {
+    min-height:100vh; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; padding:60px 22px; position:relative; z-index:1;
+    text-align:center;
+  }
+  .pays-drapeau {
+    display:flex; width:64px; height:44px; border-radius:6px; overflow:hidden;
+    margin:0 auto 26px; box-shadow:0 8px 24px -8px rgba(0,0,0,0.7); border:1px solid rgba(255,255,255,0.08);
+  }
+  .pays-drapeau .blanc { flex:1 1 100%; background:#fff; }
+  .pays-drapeau .bande { display:flex; flex-direction:column; flex:1.6 1 100%; }
+  .pays-drapeau .rouge { flex:1; background:#e5091a; }
+  .pays-drapeau .vert { flex:1; background:#0a7a3d; }
+  .pays-eyebrow {
+    font-size:12px; letter-spacing:3px; text-transform:uppercase; color:var(--muted);
+    font-weight:700; margin-bottom:10px;
+  }
+  .pays-titre {
+    font-family:var(--font-title); font-weight:800; letter-spacing:2px;
+    font-size:clamp(40px, 8vw, 74px); margin:0 0 14px; line-height:1;
+    background:linear-gradient(135deg, var(--gold-2), var(--gold) 55%, #ff9da1);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    text-shadow:0 0 60px rgba(232,189,85,0.25);
+    animation: pays-apparait .6s ease;
+  }
+  @keyframes pays-apparait { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  .pays-sous-titre { color:var(--muted); font-size:15px; max-width:480px; margin:0 auto 48px; }
+
+  .zones-grid {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr));
+    gap:22px; width:100%; max-width:900px;
+  }
+
+  .zone-carte {
+    position:relative; border-radius:18px; padding:2px; text-decoration:none; color:inherit;
+    background:linear-gradient(140deg, rgba(232,189,85,0.55), rgba(229,9,20,0.35), rgba(232,189,85,0.15));
+    box-shadow:0 20px 45px -18px rgba(0,0,0,0.85);
+    transition: transform .22s cubic-bezier(.2,.8,.2,1), box-shadow .22s ease;
+    display:block; overflow:hidden;
+  }
+  .zone-carte:hover { transform:translateY(-6px) scale(1.015); box-shadow:0 28px 60px -16px rgba(232,189,85,0.28); }
+  .zone-carte .zone-interieur {
+    position:relative; border-radius:16px; padding:34px 26px 30px;
+    background:linear-gradient(180deg, var(--panel), var(--panel-2) 120%);
+    height:100%; overflow:hidden;
+  }
+  .zone-carte .zone-interieur::after {
+    content:""; position:absolute; inset:-40% -40% auto auto; width:180px; height:180px;
+    background:radial-gradient(circle, rgba(232,189,85,0.22), transparent 70%);
+    transition: opacity .25s ease; opacity:.5;
+  }
+  .zone-carte:hover .zone-interieur::after { opacity:1; }
+  .zone-icone {
+    font-size:34px; width:64px; height:64px; display:flex; align-items:center; justify-content:center;
+    margin:0 auto 16px; border-radius:16px;
+    background:linear-gradient(135deg, rgba(232,189,85,0.18), rgba(232,189,85,0.05));
+    border:1px solid rgba(232,189,85,0.35);
+    filter:drop-shadow(0 0 14px rgba(232,189,85,0.35));
+  }
+  .zone-nom {
+    font-family:var(--font-title); font-weight:700; font-size:21px; letter-spacing:.5px;
+    margin-bottom:8px; color:var(--text);
+  }
+  .zone-desc { font-size:13px; color:var(--muted); line-height:1.5; min-height:38px; }
+  .zone-cta {
+    margin-top:18px; display:inline-flex; align-items:center; gap:6px; font-size:12.5px;
+    font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--gold-2);
+  }
+  .zone-cta svg { transition: transform .2s ease; }
+  .zone-carte:hover .zone-cta svg { transform:translateX(4px); }
+
+  .zone-carte.verrouillee {
+    background:linear-gradient(140deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+    cursor:not-allowed; box-shadow:0 12px 30px -18px rgba(0,0,0,0.8);
+  }
+  .zone-carte.verrouillee:hover { transform:none; box-shadow:0 12px 30px -18px rgba(0,0,0,0.8); }
+  .zone-carte.verrouillee .zone-interieur::after { display:none; }
+  .zone-carte.verrouillee .zone-icone {
+    background:var(--panel-2); border-color:var(--border); filter:none; opacity:.6;
+  }
+  .zone-carte.verrouillee .zone-nom, .zone-carte.verrouillee .zone-desc { opacity:.45; }
+  .zone-carte.verrouillee .zone-cta { color:var(--muted); }
+
+  .pays-pied { margin-top:56px; font-size:12px; color:var(--muted); letter-spacing:.3px; }
+  a.retour-pays {
+    color:var(--muted) !important; font-size:13px !important; display:flex; align-items:center; gap:6px;
+  }
+</style>
+"""
+
+
+def _carte_zone_html(zone):
+    if zone["disponible"]:
+        return f"""
+        <a class="zone-carte" href="{zone['url']}">
+          <div class="zone-interieur">
+            <div class="zone-icone">{zone['icone']}</div>
+            <div class="zone-nom">{zone['nom']}</div>
+            <div class="zone-desc">{zone['description']}</div>
+            <div class="zone-cta">Accéder à la zone
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+            </div>
+          </div>
+        </a>"""
+    return f"""
+        <div class="zone-carte verrouillee">
+          <div class="zone-interieur">
+            <div class="zone-icone">{zone['icone']}</div>
+            <div class="zone-nom">{zone['nom']}</div>
+            <div class="zone-desc">{zone['description']}</div>
+            <div class="zone-cta">Bientôt disponible</div>
+          </div>
+        </div>"""
+
+
+def page_accueil_pays():
+    cartes = "".join(_carte_zone_html(z) for z in ZONES_PAYS)
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Madagascar — Portail des zones</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🇲🇬%3C/text%3E%3C/svg%3E">
+{STYLE}
+{STYLE_PAYS}
+</head>
+<body>
+<div id="grille-curseur"></div>
+<div class="pays-body">
+  <div class="pays-drapeau">
+    <div class="blanc"></div>
+    <div class="bande"><div class="rouge"></div><div class="vert"></div></div>
+  </div>
+  <div class="pays-eyebrow">Portail officiel</div>
+  <h1 class="pays-titre">MADAGASCAR</h1>
+  <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
+  <div class="zones-grid">
+    {cartes}
+  </div>
+  <div class="pays-pied">🇲🇬 Madagascar</div>
+</div>
 </body>
 </html>"""
 
@@ -522,6 +707,14 @@ def configurer_site(app, bot, deps):
 
     @app.route("/")
     def racine():
+        """Portail du pays : point d'entrée du site, présente les zones
+        disponibles (Valerius, puis d'autres à venir)."""
+        return page_accueil_pays()
+
+    @app.route("/valerius")
+    def valerius_entree():
+        """Ancien comportement de la racine : entrée dans la zone Valerius,
+        avec redirection selon que l'utilisateur est connecté ou non."""
         if connecte():
             compte = compte_connecte()
             if compte:
