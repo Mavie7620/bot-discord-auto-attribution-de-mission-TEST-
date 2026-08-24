@@ -321,13 +321,12 @@ STYLE = """
   .grille-case {
     border: 1px solid rgba(229,9,20,0.05);
     background: transparent;
-    transition: background .5s ease, border-color .5s ease, box-shadow .5s ease;
+    transition: border-color .5s ease, box-shadow .5s ease;
   }
   .grille-case.actif {
-    background: rgba(229,9,20,0.4);
-    border-color: rgba(229,9,20,0.75);
-    box-shadow: 0 0 14px rgba(229,9,20,0.5) inset;
-    transition: background .06s ease, border-color .06s ease, box-shadow .06s ease;
+    border-color: rgba(229,9,20,0.95);
+    box-shadow: 0 0 9px rgba(229,9,20,0.7);
+    transition: border-color .06s ease, box-shadow .06s ease;
   }
   nav, main { position: relative; z-index: 1; }
 </style>
@@ -1126,6 +1125,8 @@ def configurer_site(app, bot, deps):
                 cible = comptes.get(login)
                 if not cible:
                     erreur = "Compte introuvable."
+                elif login == COMPTE_PROPRIETAIRE_LOGIN and connecte() != COMPTE_PROPRIETAIRE_LOGIN:
+                    erreur = f"Seul le compte {COMPTE_PROPRIETAIRE_LOGIN} peut réinitialiser son propre mot de passe."
                 elif not peut_gerer(cible.get("role")):
                     erreur = "Tu n'as pas l'autorité pour réinitialiser ce compte."
                 else:
@@ -1145,7 +1146,9 @@ def configurer_site(app, bot, deps):
                 cible = comptes.get(login)
                 if not cible:
                     erreur = "Compte introuvable."
-                elif login == connecte():
+                elif login == COMPTE_PROPRIETAIRE_LOGIN and connecte() != COMPTE_PROPRIETAIRE_LOGIN:
+                    erreur = f"Seul le compte {COMPTE_PROPRIETAIRE_LOGIN} peut modifier ses propres informations."
+                elif login == connecte() and login != COMPTE_PROPRIETAIRE_LOGIN:
                     erreur = "Tu ne peux pas modifier ton propre compte depuis cette page."
                 elif not peut_gerer(cible.get("role")):
                     erreur = "Tu n'as pas l'autorité pour modifier ce compte."
@@ -1230,7 +1233,7 @@ def configurer_site(app, bot, deps):
             <td>{{ c.discord_id or '—' }}</td>
             <td>{{ nom_serveur or '—' }}</td>
             <td>
-              {% if login != connecte_login and peut_gerer(c.role) %}
+              {% if (login == proprietaire and connecte_login == proprietaire) or (login != connecte_login and login != proprietaire and peut_gerer(c.role)) %}
               <form method="post" class="row inline">
                 <input type="hidden" name="action" value="modifier">
                 <input type="hidden" name="login" value="{{ login }}">
@@ -1257,19 +1260,19 @@ def configurer_site(app, bot, deps):
               {% endif %}
             </td>
             <td class="row">
-              {% if peut_gerer(c.role) %}
+              {% if (login == proprietaire and connecte_login == proprietaire) or (login != proprietaire and peut_gerer(c.role)) %}
               <form method="post" class="inline">
                 <input type="hidden" name="action" value="reinitialiser">
                 <input type="hidden" name="login" value="{{ login }}">
                 <button class="secondary" type="submit">Réinit. mdp</button>
               </form>
-              {% if login != proprietaire %}
+              {% endif %}
+              {% if login != proprietaire and peut_gerer(c.role) %}
               <form method="post" class="inline" onsubmit="return confirm('Supprimer ce compte ?')">
                 <input type="hidden" name="action" value="supprimer">
                 <input type="hidden" name="login" value="{{ login }}">
                 <button class="danger" type="submit">Suppr.</button>
               </form>
-              {% endif %}
               {% endif %}
             </td>
           </tr>
