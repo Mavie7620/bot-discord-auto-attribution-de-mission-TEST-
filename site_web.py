@@ -325,8 +325,8 @@ STYLE = """
     transition: border-color .5s ease, box-shadow .5s ease;
   }
   .grille-case.actif {
-    border-color: rgba(229,9,20,0.95);
-    box-shadow: 0 0 9px rgba(229,9,20,0.7);
+    border-color: rgba(229,9,20,0.4);
+    box-shadow: 0 0 4px rgba(229,9,20,0.3);
     transition: border-color .06s ease, box-shadow .06s ease;
   }
   nav, main { position: relative; z-index: 1; }

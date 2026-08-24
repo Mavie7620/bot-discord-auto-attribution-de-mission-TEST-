@@ -111,6 +111,36 @@ def ajouter_historique(p_id, profils, texte, statut, cat="inconnu"):
         "date": datetime.now().strftime("%d/%m/%Y à %H:%M")
     })
 
+DELAI_MIN_REPETITION_MISSION = timedelta(days=7)
+
+def mission_recemment_donnee(guild_id, joueur_id, texte, delai=DELAI_MIN_REPETITION_MISSION):
+    """True si ce joueur a déjà eu cette mission (texte strictement
+    identique) sur ce serveur il y a moins de `delai` (par défaut 7 jours),
+    peu importe si elle a été réussie ou échouée."""
+    profils = charger_profils(guild_id)
+    profil = profils.get(str(joueur_id))
+    if not profil:
+        return False
+    limite = datetime.now() - delai
+    for entree in profil.get("historique", []):
+        if entree.get("texte") != texte:
+            continue
+        try:
+            date_entree = datetime.strptime(entree.get("date", ""), "%d/%m/%Y à %H:%M")
+        except (ValueError, TypeError):
+            continue
+        if date_entree >= limite:
+            return True
+    return False
+
+def choisir_mission_sans_repetition(guild_id, joueur_id, missions_liste, delai=DELAI_MIN_REPETITION_MISSION):
+    """Tire une mission au hasard dans `missions_liste` en excluant celles
+    que le joueur a déjà eues il y a moins de `delai`. S'il n'en reste
+    aucune de "fraîche" (catégorie trop restreinte), on retombe sur
+    l'ensemble complet plutôt que de bloquer l'attribution."""
+    fraiches = [m for m in missions_liste if not mission_recemment_donnee(guild_id, joueur_id, m["texte"], delai)]
+    return random.choice(fraiches) if fraiches else random.choice(missions_liste)
+
 def extraire_duree(delai_texte):
     """Parse une durée à partir d'un texte libre.
     Accepte aussi bien les formats compacts ("2h", "3j", "45min")
@@ -862,7 +892,7 @@ class VueChoixDifficulte(VueVerrouillable):
             await interaction.response.send_message(f"❌ Plus de mission disponible dans la catégorie `{cat.upper()}` sur ce serveur.", ephemeral=True)
             return
 
-        mission_choisie = random.choice(missions_dispo[cat])
+        mission_choisie = choisir_mission_sans_repetition(guild_id, self.joueur_id, missions_dispo[cat])
         duree = extraire_duree(mission_choisie["delai"])
         date_fin = datetime.now() + duree
         timestamp_discord = int(date_fin.timestamp())
@@ -1603,7 +1633,7 @@ async def attribuer_mission(interaction: discord.Interaction, joueur: discord.Me
         await interaction.response.send_message(f"❌ Plus aucune mission disponible dans la catégorie `{cat.upper()}` sur ce serveur.", ephemeral=True)
         return
 
-    mission_choisie = random.choice(missions_dispo[cat])
+    mission_choisie = choisir_mission_sans_repetition(guild_id, joueur.id, missions_dispo[cat])
     duree = extraire_duree(mission_choisie["delai"])
     date_fin = datetime.now() + duree
     timestamp_discord = int(date_fin.timestamp())
