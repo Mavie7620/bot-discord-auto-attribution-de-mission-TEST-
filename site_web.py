@@ -439,7 +439,7 @@ def page_html(titre, corps, connecte=None, role=None):
 </head>
 <body>
 <div id="grille-curseur"></div>
-<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar">🇲🇬 Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
+<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/static/drapeau.jpg" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
 <main>
 {corps}
 </main>
@@ -487,13 +487,13 @@ STYLE_PAYS = """
     text-align:center;
   }
   .pays-drapeau {
-    display:flex; width:64px; height:44px; border-radius:6px; overflow:hidden;
-    margin:0 auto 26px; box-shadow:0 8px 24px -8px rgba(0,0,0,0.7); border:1px solid rgba(255,255,255,0.08);
+    display:block; width:88px; height:60px; object-fit:cover; border-radius:8px;
+    margin:0 auto 26px; box-shadow:0 8px 24px -8px rgba(0,0,0,0.7); border:1px solid rgba(255,255,255,0.12);
   }
-  .pays-drapeau .blanc { flex:1 1 100%; background:#fff; }
-  .pays-drapeau .bande { display:flex; flex-direction:column; flex:1.6 1 100%; }
-  .pays-drapeau .rouge { flex:1; background:#e5091a; }
-  .pays-drapeau .vert { flex:1; background:#0a7a3d; }
+  nav .drapeau-nav {
+    display:inline-block; width:22px; height:15px; object-fit:cover; border-radius:3px;
+    border:1px solid rgba(255,255,255,0.15); vertical-align:middle; margin-right:6px;
+  }
   .pays-eyebrow {
     font-size:12px; letter-spacing:3px; text-transform:uppercase; color:var(--muted);
     font-weight:700; margin-bottom:10px;
@@ -596,8 +596,19 @@ def _carte_zone_html(zone):
         </div>"""
 
 
-def page_accueil_pays():
+def page_accueil_pays(connecte=None, role=None):
+    """Portail du pays : réservé aux comptes connectés (voir @login_required
+    sur la route "/"). Affiche les zones auxquelles le compte peut accéder."""
     cartes = "".join(_carte_zone_html(z) for z in ZONES_PAYS)
+    nav_html = ""
+    if connecte:
+        badge_icone = "👑 " if role == "proprietaire" else ""
+        badge = f'<span class="badge {role}">{badge_icone}{ROLE_LABELS.get(role, role)}</span>' if role else ""
+        nav_html = (
+            '<nav><span class="brand">🇲🇬 MADAGASCAR</span>'
+            f'<span class="muted">{connecte}</span>{badge}'
+            '<a href="/deconnexion">Déconnexion</a></nav>'
+        )
     return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -607,24 +618,22 @@ def page_accueil_pays():
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🇲🇬%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="/static/drapeau.jpg">
 {STYLE}
 {STYLE_PAYS}
 </head>
 <body>
 <div id="grille-curseur"></div>
+{nav_html}
 <div class="pays-body">
-  <div class="pays-drapeau">
-    <div class="blanc"></div>
-    <div class="bande"><div class="rouge"></div><div class="vert"></div></div>
-  </div>
+  <img class="pays-drapeau" src="/static/drapeau.jpg" alt="Drapeau de Madagascar">
   <div class="pays-eyebrow">Portail officiel</div>
   <h1 class="pays-titre">MADAGASCAR</h1>
   <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
   <div class="zones-grid">
     {cartes}
   </div>
-  <div class="pays-pied">🇲🇬 Madagascar</div>
+  <div class="pays-pied">🇲🇬 Madagascar — connecté en tant que {connecte or ''}</div>
 </div>
 </body>
 </html>"""
@@ -706,22 +715,26 @@ def configurer_site(app, bot, deps):
     # ---------- Authentification ----------
 
     @app.route("/")
+    @login_required
     def racine():
-        """Portail du pays : point d'entrée du site, présente les zones
-        disponibles (Valerius, puis d'autres à venir)."""
-        return page_accueil_pays()
+        """Portail du pays : point d'entrée du site. Réservé aux comptes
+        connectés — @login_required renvoie vers /connexion sinon (et vers
+        le changement de mot de passe si celui-ci est encore temporaire).
+        Présente les zones auxquelles le compte a accès (Valerius, puis
+        d'autres à venir)."""
+        compte = compte_connecte()
+        return page_accueil_pays(connecte(), compte.get("role") if compte else None)
 
     @app.route("/valerius")
+    @login_required
     def valerius_entree():
-        """Ancien comportement de la racine : entrée dans la zone Valerius,
-        avec redirection selon que l'utilisateur est connecté ou non."""
-        if connecte():
-            compte = compte_connecte()
-            if compte:
-                if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
-                    return redirect(url_for("admin_serveurs"))
-                return redirect(url_for("mon_profil"))
-        return redirect(url_for("connexion"))
+        """Entrée dans la zone Valerius : redirige le compte connecté vers
+        la bonne page selon son rôle. Protégée par @login_required comme
+        toute zone du portail — jamais accessible sans compte."""
+        compte = compte_connecte()
+        if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
+            return redirect(url_for("admin_serveurs"))
+        return redirect(url_for("mon_profil"))
 
     @app.route("/inscription", methods=["GET", "POST"])
     def inscription():
