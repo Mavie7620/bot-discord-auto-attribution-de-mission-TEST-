@@ -839,9 +839,74 @@ def configurer_site(app, bot, deps):
             <button type="submit" style="width:100%">Se connecter</button>
           </form>
           <p class="muted" style="text-align:center;margin-top:14px;"><a href="/inscription">Créer un compte</a></p>
+          <p class="muted" style="text-align:center;margin-top:6px;"><a href="/mot-de-passe-oublie">Mot de passe oublié ?</a></p>
         </div>
         """, erreur=erreur)
         return page_html("Connexion", corps)
+
+    @app.route("/mot-de-passe-oublie", methods=["GET", "POST"])
+    def mot_de_passe_oublie():
+        """Réinitialisation en libre-service. Comme le site n'a pas de
+        système d'e-mail, le nouveau mot de passe temporaire est envoyé
+        en message privé Discord au compte relié (discord_id), sur le
+        même principe que la création du compte propriétaire.
+        Le message affiché est volontairement générique dans tous les
+        cas (compte inexistant, non relié à Discord, DM impossible...)
+        pour ne jamais révéler si un identifiant existe sur le site."""
+        message = None
+        erreur = None
+        if request.method == "POST":
+            login = request.form.get("login", "").strip()
+            comptes = charger_comptes()
+            compte = comptes.get(login)
+            if compte and compte.get("discord_id"):
+                try:
+                    discord_id = int(compte["discord_id"])
+                    mot_de_passe_genere = _generer_mot_de_passe()
+
+                    async def _envoyer_dm():
+                        utilisateur = bot.get_user(discord_id) or await bot.fetch_user(discord_id)
+                        await utilisateur.send(
+                            "🔑 **Réinitialisation de mot de passe — Site Valerius**\n"
+                            f"Identifiant : `{login}`\n"
+                            f"Nouveau mot de passe temporaire : `{mot_de_passe_genere}`\n"
+                            "⚠️ Il te sera demandé de le changer dès ta prochaine connexion.\n"
+                            "Si tu n'es pas à l'origine de cette demande, préviens un instructeur."
+                        )
+
+                    future = asyncio.run_coroutine_threadsafe(_envoyer_dm(), bot.loop)
+                    future.result(timeout=10)
+
+                    # Le mot de passe n'est mis à jour qu'une fois le DM
+                    # confirmé envoyé, pour ne jamais bloquer l'accès à
+                    # un compte si l'envoi Discord échoue silencieusement.
+                    comptes[login]["password_hash"] = generate_password_hash(mot_de_passe_genere)
+                    comptes[login]["must_change_password"] = True
+                    sauvegarder_comptes(comptes)
+                    deps["sauvegarder_log_disque"](f"🔑 Mot de passe réinitialisé via « mot de passe oublié » pour « {login} ».")
+                except Exception:
+                    pass
+            message = ("Si un compte existe avec cet identifiant et qu'il est relié à un compte Discord, "
+                       "un nouveau mot de passe temporaire vient de lui être envoyé en message privé sur Discord.")
+        corps = render_template_string("""
+        <div class="card" style="max-width:400px;margin:60px auto;">
+          <h1>Mot de passe oublié</h1>
+          <p class="muted">Indique ton identifiant : si ton compte est relié à ton Discord, tu recevras un nouveau mot de passe temporaire par message privé.</p>
+          {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+          {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+          {% if not message %}
+          <form method="post">
+            <p><input name="login" placeholder="Identifiant" required style="width:100%"></p>
+            <button type="submit" style="width:100%">Envoyer un nouveau mot de passe</button>
+          </form>
+          {% endif %}
+          <p class="muted" style="text-align:center;margin-top:14px;">
+            Ton compte n'est relié à aucun Discord, ou tu n'as rien reçu ? Contacte un instructeur pour qu'il réinitialise ton mot de passe manuellement.<br>
+            <a href="/connexion">← Retour à la connexion</a>
+          </p>
+        </div>
+        """, message=message, erreur=erreur)
+        return page_html("Mot de passe oublié", corps)
 
     @app.route("/deconnexion")
     def deconnexion():
