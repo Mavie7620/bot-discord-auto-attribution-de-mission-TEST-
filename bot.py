@@ -101,14 +101,15 @@ def initialiser_profil(p_id, profils):
             "historique": []
         }
 
-def ajouter_historique(p_id, profils, texte, statut, cat="inconnu"):
+def ajouter_historique(p_id, profils, texte, statut, cat="inconnu", duree_secondes=None):
     s_id = str(p_id)
     initialiser_profil(p_id, profils)
     profils[s_id]["historique"].insert(0, {
         "texte": texte,
         "statut": statut,
         "categorie": cat,
-        "date": datetime.now().strftime("%d/%m/%Y à %H:%M")
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+        "duree_secondes": duree_secondes
     })
 
 DELAI_MIN_REPETITION_MISSION = timedelta(days=7)
@@ -685,7 +686,8 @@ async def action_accepter_mission(joueur_id, channel):
         profils = charger_profils(g_id)
         initialiser_profil(joueur_id, profils)
         profils[str(joueur_id)]["total_reussies"] += 1
-        ajouter_historique(joueur_id, profils, m_info["texte"], "Succès", m_info["cat"])
+        duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
+        ajouter_historique(joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes)
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
         
@@ -704,7 +706,8 @@ async def action_refuser_mission(joueur_id, channel):
         profils = charger_profils(g_id)
         initialiser_profil(joueur_id, profils)
         profils[str(joueur_id)]["total_echouees"] += 1
-        ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"])
+        duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
+        ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
         
@@ -792,7 +795,8 @@ async def verifier_temps_missions():
                 profils = charger_profils(guild_id)
                 initialiser_profil(joueur_id, profils)
                 profils[str(joueur_id)]["total_echouees"] += 1
-                ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"])
+                duree_secondes = (maintenant - date_debut).total_seconds()
+                ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
                 sauvegarder_profils(guild_id, profils)
 
                 role_instructeur = discord.utils.get(guild.roles, name="[ 🎴[Instruction] ]")

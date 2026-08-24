@@ -90,6 +90,69 @@ def guild_autorise(compte, guild_id):
     return str(compte.get("guild_id")) == str(guild_id)
 
 
+# ================= STATISTIQUES DES MISSIONS =================
+
+def formater_duree_secondes(secondes):
+    """Formate une durée en secondes en texte lisible (ex: '2j 5h 12min')."""
+    if secondes is None or secondes < 0:
+        return "—"
+    secondes = int(secondes)
+    jours, reste = divmod(secondes, 86400)
+    heures, reste = divmod(reste, 3600)
+    minutes = reste // 60
+    if jours:
+        return f"{jours}j {heures}h {minutes}min"
+    if heures:
+        return f"{heures}h {minutes}min"
+    return f"{minutes}min"
+
+
+def calculer_stats_missions(guild_id, deps):
+    """Agrège, pour un serveur donné, le taux de réussite global, la mission
+    la plus/la moins populaire (nombre de fois attribuée, tous statuts
+    confondus) et le temps moyen de complétion des missions réussies."""
+    profils = deps["charger_profils"](guild_id)
+
+    total_reussies = 0
+    total_echouees = 0
+    popularite = {}  # texte -> {"count": int, "categorie": str}
+    durees_succes = []
+
+    for profil in profils.values():
+        total_reussies += profil.get("total_reussies", 0)
+        total_echouees += profil.get("total_echouees", 0)
+        for entree in profil.get("historique", []):
+            texte = entree.get("texte", "?")
+            info = popularite.setdefault(texte, {"count": 0, "categorie": entree.get("categorie", "inconnu")})
+            info["count"] += 1
+            if entree.get("statut") == "Succès" and entree.get("duree_secondes") is not None:
+                durees_succes.append(entree["duree_secondes"])
+
+    total_missions = total_reussies + total_echouees
+    taux_reussite = round((total_reussies / total_missions) * 100, 1) if total_missions else None
+
+    mission_plus_populaire = None
+    mission_moins_populaire = None
+    if popularite:
+        mission_plus_populaire = max(popularite.items(), key=lambda kv: kv[1]["count"])
+        mission_moins_populaire = min(popularite.items(), key=lambda kv: kv[1]["count"])
+
+    temps_moyen_secondes = (sum(durees_succes) / len(durees_succes)) if durees_succes else None
+
+    return {
+        "total_reussies": total_reussies,
+        "total_echouees": total_echouees,
+        "total_missions": total_missions,
+        "taux_reussite": taux_reussite,
+        "mission_plus_populaire": mission_plus_populaire,
+        "mission_moins_populaire": mission_moins_populaire,
+        "nb_missions_distinctes": len(popularite),
+        "temps_moyen_secondes": temps_moyen_secondes,
+        "temps_moyen_texte": formater_duree_secondes(temps_moyen_secondes),
+        "nb_completions_chronometrees": len(durees_succes),
+    }
+
+
 # ================= GESTION DES COMPTES =================
 
 ANCIENS_ROLES_VERS_NOUVEAUX = {
@@ -1083,12 +1146,61 @@ def configurer_site(app, bot, deps):
             {% endif %}
             <a class="btnlink" href="/admin/missions-actives/{{ g.id }}">Missions en cours</a>
             <a class="btnlink" href="/admin/profils/{{ g.id }}">Profils</a>
+            <a class="btnlink" href="/admin/statistiques/{{ g.id }}">Statistiques</a>
           </div>
         </div>
         {% endfor %}
         """, guilds=guilds, super_admin=(compte.get("role") == "proprietaire"),
              peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("instructeur")))
         return page_html("Serveurs", corps, connecte(), compte.get("role"))
+
+    # ---------- Statistiques des missions (instructeur et plus, scope serveur) ----------
+
+    @app.route("/admin/statistiques/<int:guild_id>")
+    @role_required("instructeur")
+    def admin_statistiques(guild_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        stats = calculer_stats_missions(guild_id, deps)
+
+        corps = render_template_string("""
+        <h1>Statistiques des missions</h1>
+        <p class="muted">Serveur {{ g.name if g else guild_id }}</p>
+
+        {% if not stats.total_missions %}
+        <div class="card">Aucune mission terminée pour l'instant sur ce serveur — les statistiques apparaîtront dès la première mission réussie ou échouée.</div>
+        {% else %}
+        <div class="stats-grid">
+          <div class="stat-card"><div class="valeur">{{ stats.taux_reussite }}%</div><div class="label">Taux de réussite</div></div>
+          <div class="stat-card"><div class="valeur">{{ stats.total_reussies }}</div><div class="label">Missions réussies</div></div>
+          <div class="stat-card"><div class="valeur">{{ stats.total_echouees }}</div><div class="label">Missions échouées</div></div>
+          <div class="stat-card"><div class="valeur">{{ stats.temps_moyen_texte }}</div><div class="label">Temps moyen de complétion</div></div>
+        </div>
+        {% if not stats.nb_completions_chronometrees %}
+        <p class="muted">Le temps moyen de complétion n'a pas encore de donnée exploitable (missions terminées avant la mise en place du chrono).</p>
+        {% endif %}
+
+        <h2>Popularité des missions</h2>
+        <div class="card row" style="justify-content:space-between;">
+          <div>
+            <div class="muted">Mission la plus populaire</div>
+            <strong>{{ stats.mission_plus_populaire[0] }}</strong>
+            <div class="muted">{{ stats.mission_plus_populaire[1].categorie|capitalize }} — attribuée {{ stats.mission_plus_populaire[1].count }} fois</div>
+          </div>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div>
+            <div class="muted">Mission la moins populaire</div>
+            <strong>{{ stats.mission_moins_populaire[0] }}</strong>
+            <div class="muted">{{ stats.mission_moins_populaire[1].categorie|capitalize }} — attribuée {{ stats.mission_moins_populaire[1].count }} fois</div>
+          </div>
+        </div>
+        <p class="muted">Calculé sur {{ stats.nb_missions_distinctes }} mission(s) distincte(s) déjà attribuée(s) au moins une fois.</p>
+        {% endif %}
+        """, stats=stats, g=g, guild_id=guild_id)
+        return page_html("Statistiques", corps, connecte(), compte.get("role"))
 
     # ---------- Catalogue de missions (instructeur et plus, scope serveur) ----------
 
@@ -1211,13 +1323,14 @@ def configurer_site(app, bot, deps):
                     m_info = missions_actives[guild_id][joueur_id]
                     profils = deps["charger_profils"](guild_id)
                     deps["initialiser_profil"](joueur_id, profils)
+                    duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
                     if statut == "succes":
                         profils[str(joueur_id)]["total_reussies"] += 1
-                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Succès", m_info["cat"])
+                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes)
                         message = "Mission marquée comme réussie."
                     else:
                         profils[str(joueur_id)]["total_echouees"] += 1
-                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Échec", m_info["cat"])
+                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
                         message = "Mission marquée comme échouée."
                     deps["sauvegarder_profils"](guild_id, profils)
                     del missions_actives[guild_id][joueur_id]
@@ -1910,6 +2023,7 @@ def configurer_site(app, bot, deps):
           <div><strong>{{ g.name }}</strong><div class="muted">ID : {{ g.id }} — {{ g.member_count }} membres</div></div>
           <div class="row">
             <span class="pill {{ 'on' if nb_actives_g else 'off' }}">{{ nb_actives_g }} mission(s) en cours</span>
+            <a class="btnlink" href="/admin/statistiques/{{ g.id }}">Statistiques</a>
             <a class="btnlink" href="/admin/serveurs">Gérer</a>
           </div>
         </div>
