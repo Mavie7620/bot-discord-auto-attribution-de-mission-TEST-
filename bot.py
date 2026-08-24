@@ -41,6 +41,7 @@ WELCOME_CHANNEL_ID = 1534604841660190792
 ATTENTE_MOOV_ID = 1534604587992875280
 SALON_PALAIS_ROYAL_ID = 1519322938430722129
 SALON_VALIDATION_MISSION_ID = 1534638388286853273
+SALON_ANNONCE_MAINTENANCE_ID = 1517995293944057867
 
 def get_file_name(guild_id):
     return f"valerius_missions_{guild_id}.txt"
@@ -141,6 +142,31 @@ def extraire_duree(delai_texte):
             return timedelta(days=valeur)
 
     return timedelta(days=3)
+
+def barre_progression(temps_ecoule, duree_totale, longueur=12):
+    """Construit une barre de progression textuelle (🟩/⬛) à partir du temps
+    écoulé et de la durée totale d'une mission. Retourne (barre, ratio 0-1)."""
+    if duree_totale.total_seconds() <= 0:
+        ratio = 1.0
+    else:
+        ratio = temps_ecoule.total_seconds() / duree_totale.total_seconds()
+    ratio = max(0.0, min(1.0, ratio))
+    remplies = round(ratio * longueur)
+    barre = "🟩" * remplies + "⬛" * (longueur - remplies)
+    return barre, ratio
+
+def formater_duree(delta):
+    """Formate un timedelta en texte lisible 'Xj Xh Xmn Xs' (sans les unités à 0)."""
+    total = int(max(0, delta.total_seconds()))
+    jours, reste = divmod(total, 86400)
+    heures, reste = divmod(reste, 3600)
+    minutes, secondes = divmod(reste, 60)
+    parts = []
+    if jours: parts.append(f"{jours}j")
+    if heures: parts.append(f"{heures}h")
+    if minutes: parts.append(f"{minutes}mn")
+    if not parts or secondes: parts.append(f"{secondes}s")
+    return " ".join(parts)
 
 missions_actives = {}
 
@@ -1902,8 +1928,9 @@ async def historique(interaction: discord.Interaction, joueur: discord.Member = 
     userData = profils[str(cible.id)]
     hist = userData["historique"]
     
-    embed = discord.Embed(title=f"📜 ARCHIVES ET PARCHEMIN — {cible.display_name}", color=discord.Color.blue())
+    embed = discord.Embed(title=f"📜 {cible.display_name}", description="**ARCHIVES ET PARCHEMIN**", color=discord.Color.blue())
     embed.set_thumbnail(url=cible.display_avatar.url)
+    embed.set_footer(text=f"ID Discord : {cible.id}")
     embed.add_field(name="📊 Bilan des Objectifs", value=f"🟢 **RÉUSSIES :** `{userData['total_reussies']}`\n🔴 **ÉCHOUÉES :** `{userData['total_echouees']}`", inline=False)
     
     if not hist:
@@ -1952,7 +1979,99 @@ async def ajouterhistorique(interaction: discord.Interaction, joueur: discord.Me
 
     await interaction.response.send_message(f"✅ Ajouté avec succès dans l'historique de {joueur.mention} !\nStatut : **{statut}** | Catégorie : **{categorie.upper()}** — *{texte}*", ephemeral=True)
 
-@bot.tree.command(name="mission_expiration", description="Avertit et planifie la suppression du ticket d'ordre s'il reste inactif pendant 1 heure.")
+@bot.tree.command(name="retirerhistorique", description="Retire une entrée de l'historique d'un joueur et ajuste ses compteurs.")
+@app_commands.describe(joueur="Le citoyen ciblé", position="Position dans l'historique (1 = la plus récente)")
+async def retirerhistorique(interaction: discord.Interaction, joueur: discord.Member, position: int = 1):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    g_id = interaction.guild.id
+    profils = charger_profils(g_id)
+    initialiser_profil(joueur.id, profils)
+    hist = profils[str(joueur.id)]["historique"]
+    index = position - 1
+
+    if index < 0 or index >= len(hist):
+        await interaction.response.send_message(f"❌ Position invalide. Cet historique contient {len(hist)} entrée(s).", ephemeral=True)
+        return
+
+    entree = hist.pop(index)
+    if entree.get("statut") == "Succès":
+        profils[str(joueur.id)]["total_reussies"] = max(0, profils[str(joueur.id)]["total_reussies"] - 1)
+    else:
+        profils[str(joueur.id)]["total_echouees"] = max(0, profils[str(joueur.id)]["total_echouees"] - 1)
+    sauvegarder_profils(g_id, profils)
+
+    await interaction.response.send_message(f"🗑️ Entrée retirée de l'historique de {joueur.mention} : *\"{entree.get('texte', '?')}\"* ({entree.get('statut', '?')}).", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - HISTORIQUE : {interaction.user.name} a retiré une entrée de l'historique de {joueur.name} sur {interaction.guild.name}")
+
+@bot.tree.command(name="temps_mission", description="Ajoute ou retire du temps sur la mission active d'un joueur.")
+@app_commands.describe(joueur="Le joueur concerné", duree="Durée à ajouter/retirer (ex: 2h, 1 jour, 30min)", retirer="Retirer ce temps au lieu de l'ajouter")
+async def temps_mission(interaction: discord.Interaction, joueur: discord.Member, duree: str, retirer: bool = False):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    g_id = interaction.guild.id
+    if g_id not in missions_actives or joueur.id not in missions_actives[g_id]:
+        await interaction.response.send_message(f"❌ {joueur.mention} n'a aucune mission active sur ce serveur.", ephemeral=True)
+        return
+
+    delta = extraire_duree(duree)
+    m_info = missions_actives[g_id][joueur.id]
+    ancienne_echeance = m_info["date_fin"]
+
+    if retirer:
+        m_info["date_fin"] -= delta
+        m_info["duree_totale"] -= delta
+    else:
+        m_info["date_fin"] += delta
+        m_info["duree_totale"] += delta
+
+    # Garde-fous : jamais de durée totale nulle/négative ni d'échéance déjà dans le passé
+    if m_info["duree_totale"].total_seconds() <= 0:
+        m_info["duree_totale"] = timedelta(seconds=1)
+    if m_info["date_fin"] <= datetime.now():
+        m_info["date_fin"] = datetime.now() + timedelta(seconds=1)
+
+    maintenant = datetime.now()
+    timestamp_ancien = int(ancienne_echeance.timestamp())
+    timestamp_nouveau = int(m_info["date_fin"].timestamp())
+    verbe = "retiré" if retirer else "ajouté"
+    emoji_verbe = "➖" if retirer else "➕"
+    couleur = discord.Color.orange() if retirer else discord.Color.green()
+
+    temps_ecoule = maintenant - m_info["date_debut"]
+    barre, ratio = barre_progression(temps_ecoule, m_info["duree_totale"])
+    temps_restant_txt = formater_duree(m_info["date_fin"] - maintenant)
+
+    # Ré-arme les alertes si on redonne assez de marge, pour qu'elles se redéclenchent normalement
+    if not retirer:
+        if ratio < 0.5: m_info["alerte_moitie"] = False
+        if ratio < 0.75: m_info["alerte_un_quart"] = False
+
+    embed_temps = discord.Embed(title="⏱️ CHRONO DE MISSION MODIFIÉ", color=couleur)
+    embed_temps.add_field(name="🎯 Objectif", value=f"*{m_info['texte']}*", inline=False)
+    embed_temps.add_field(name=f"{emoji_verbe} Modification", value=f"**{duree}** {verbe} par {interaction.user.mention}", inline=False)
+    embed_temps.add_field(name="📆 Ancienne échéance", value=f"<t:{timestamp_ancien}:f>", inline=True)
+    embed_temps.add_field(name="🆕 Nouvelle échéance", value=f"<t:{timestamp_nouveau}:R>\n(<t:{timestamp_nouveau}:f>)", inline=True)
+    embed_temps.add_field(name="⏳ Temps restant", value=f"`{temps_restant_txt}`", inline=True)
+    embed_temps.add_field(name="📊 Progression du chrono", value=f"{barre} `{round(ratio * 100)}%`", inline=False)
+    embed_temps.set_thumbnail(url=joueur.display_avatar.url)
+    embed_temps.set_footer(text="Le décompte a été ajusté par l'administration — reste attentif à l'échéance.")
+
+    await interaction.response.send_message(f"✅ Temps mis à jour pour {joueur.mention}.", ephemeral=True)
+
+    salon_ticket = bot.get_channel(m_info["channel_id"]) or interaction.channel
+    try:
+        await salon_ticket.send(content=f"{joueur.mention}", embed=embed_temps)
+    except Exception as e:
+        await envoyer_log_proprietaire(bot, f"LOG ABSOLU - ERREUR NOTIF TEMPS MISSION : impossible de notifier le ticket de {joueur.name} sur {interaction.guild.name} ({e})")
+
+    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - TEMPS MISSION : {interaction.user.name} a {verbe} {duree} sur la mission de {joueur.name} sur {interaction.guild.name}")
+
+
 @app_commands.describe(joueur="Le citoyen propriétaire du ticket d'ordre")
 async def mission_expiration(interaction: discord.Interaction, joueur: discord.Member):
     if not verifier_permissions_staff(interaction.user):
@@ -2163,6 +2282,8 @@ site_web.configurer_site(app, bot, {
     "guildes_deverrouillees": guildes_deverrouillees,
     "charger_maintenance": charger_maintenance,
     "definir_maintenance": definir_maintenance,
+    "salon_annonce_maintenance_id": SALON_ANNONCE_MAINTENANCE_ID,
+    "extraire_duree": extraire_duree,
 })
 
 keep_alive()

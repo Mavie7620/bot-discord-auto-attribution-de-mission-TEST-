@@ -10,30 +10,28 @@ des backups...) lui sont injectées via configurer_site(app, bot, deps)
 pour éviter tout import circulaire avec bot.py.
 
 ================= SYSTEME DE RÔLES =================
-Six rôles, du plus faible au plus fort :
-  recrue < membre < instructeur < admin < super_admin < proprietaire
+Trois rôles, du plus faible au plus fort :
+  malgache < instructeur < proprietaire
 
 - N'importe qui avec le lien peut créer un compte via /inscription.
-  Le compte créé est toujours "recrue" au départ, et l'inscrit doit
+  Le compte créé est toujours "malgache" au départ, et l'inscrit doit
   choisir le serveur Discord auquel il appartient. Ce choix est
   DÉFINITIF de son côté : lui seul ne peut plus le changer ensuite.
-- "instructeur" et plus : accède à /admin/serveurs, mais seulement
-  au(x) serveur(s) qui lui sont assignés (sauf proprietaire : tous).
-- "admin" et plus : peut en plus gérer le catalogue de missions et
-  les comptes du site (créer/modifier/supprimer), mais seulement
-  pour son propre serveur, et seulement des comptes d'un rôle
-  strictement inférieur au sien (impossible de créer/modifier un
-  compte super_admin ou proprietaire si on n'est pas soi-même
-  proprietaire). C'est un admin (ou plus) qui peut changer le
-  serveur assigné à un compte.
-- "super_admin" (Super Modo) : mêmes droits qu'un admin, mais
-  reste cantonné à SON SEUL serveur assigné — il n'a aucune vue
-  ni aucun accès sur les autres serveurs.
+- "malgache" : accès de base (/mon-profil, historique personnel)
+  + accès en lecture au catalogue de missions de son serveur
+  (/mon-catalogue).
+- "instructeur" et plus : accède à /admin/serveurs (scope limité à
+  son serveur assigné, sauf proprietaire : tous), peut gérer le
+  catalogue de missions (ajout/suppression) et les comptes du site
+  (créer/modifier/supprimer), mais seulement pour son propre
+  serveur, et seulement des comptes d'un rôle strictement inférieur
+  au sien (impossible de créer/modifier un compte proprietaire si
+  on n'est pas soi-même proprietaire).
 - "proprietaire" (Propriétaire) : seul rang avec un accès total et
   global, sur tous les serveurs, y compris les sauvegardes
   complètes (/admin/backup). C'est aussi le seul rang habilité à
-  attribuer le rôle "proprietaire" ou "super_admin" à un autre
-  compte, ou à changer le serveur assigné à n'importe quel compte.
+  attribuer le rôle "proprietaire" à un autre compte, ou à changer
+  le serveur assigné à n'importe quel compte.
   Le compte historique MAVIE7620 est toujours proprietaire.
 """
 import os
@@ -51,13 +49,10 @@ COMPTES_FILE = "valerius_comptes.json"
 SECRET_KEY_FILE = "valerius_secret.key"
 COMPTE_PROPRIETAIRE_LOGIN = "MAVIE7620"
 
-ROLES_ORDRE = ["recrue", "membre", "instructeur", "admin", "super_admin", "proprietaire"]
+ROLES_ORDRE = ["malgache", "instructeur", "proprietaire"]
 ROLE_LABELS = {
-    "recrue": "Recrue",
-    "membre": "Membre",
+    "malgache": "Malgache",
     "instructeur": "Instructeur",
-    "admin": "Admin",
-    "super_admin": "Super Modo",
     "proprietaire": "Propriétaire",
 }
 
@@ -71,8 +66,8 @@ def niveau_role(role):
 
 def guild_autorise(compte, guild_id):
     """True si ce compte a le droit de voir/gérer les données de ce serveur.
-    Seul le rang Propriétaire a un accès global à tous les serveurs — le
-    Super Modo (super_admin), lui, reste limité à son unique serveur assigné."""
+    Seul le rang Propriétaire a un accès global à tous les serveurs — un
+    Instructeur, lui, reste limité à son unique serveur assigné."""
     if not compte:
         return False
     if compte.get("role") == "proprietaire":
@@ -82,19 +77,29 @@ def guild_autorise(compte, guild_id):
 
 # ================= GESTION DES COMPTES =================
 
+ANCIENS_ROLES_VERS_NOUVEAUX = {
+    "user": "malgache",
+    "recrue": "malgache",
+    "membre": "malgache",
+    "admin": "instructeur",
+    "super_admin": "instructeur",
+}
+
+
 def _migrer_comptes(comptes):
-    """Migration douce de l'ancien système (rôles 'admin'/'user') vers
-    la nouvelle hiérarchie à 5 rôles, sans casser les comptes existants."""
+    """Migration douce des anciens systèmes de rôles (5 puis 6 rôles) vers
+    la nouvelle hiérarchie à 3 rôles, sans casser les comptes existants."""
     modifie = False
     for login, c in comptes.items():
-        if c.get("role") == "user":
-            c["role"] = "membre"
+        role_actuel = c.get("role")
+        if role_actuel in ANCIENS_ROLES_VERS_NOUVEAUX:
+            c["role"] = ANCIENS_ROLES_VERS_NOUVEAUX[role_actuel]
             modifie = True
         if login == COMPTE_PROPRIETAIRE_LOGIN and c.get("role") != "proprietaire":
             c["role"] = "proprietaire"
             modifie = True
         if c.get("role") not in ROLES_ORDRE:
-            c["role"] = "recrue"
+            c["role"] = "malgache"
             modifie = True
         c.setdefault("guild_id", None)
         c.setdefault("discord_id", None)
@@ -185,20 +190,30 @@ STYLE = """
     --red: #ef5a56;
     --green: #3fd68c;
     --shadow: 0 10px 30px -12px rgba(0,0,0,0.55);
+    --font-title: "Cinzel", "Segoe UI", serif;
+    --font-body: "Inter", "Segoe UI", -apple-system, Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
-    margin:0; font-family:"Segoe UI",-apple-system,Roboto,Inter,sans-serif;
+    margin:0; font-family:var(--font-body);
     background:
-      radial-gradient(1200px 600px at 15% -10%, rgba(232,189,85,0.08), transparent 60%),
-      radial-gradient(900px 500px at 100% 0%, rgba(79,140,214,0.06), transparent 55%),
+      radial-gradient(1200px 600px at 15% -10%, rgba(232,189,85,0.10), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(79,140,214,0.07), transparent 55%),
+      radial-gradient(800px 500px at 50% 100%, rgba(232,189,85,0.05), transparent 60%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180' viewBox='0 0 180 180'%3E%3Cg fill='none' stroke='%23e8bd55' stroke-width='1' opacity='0.05'%3E%3Ccircle cx='90' cy='90' r='60'/%3E%3Cpath d='M90 25 L101 79 L155 90 L101 101 L90 155 L79 101 L25 90 L79 79 Z'/%3E%3C/g%3E%3C/svg%3E"),
       var(--bg);
+    background-attachment: fixed, fixed, fixed, fixed, fixed;
+    background-size: auto, auto, auto, 180px 180px, auto;
     color:var(--text); min-height:100vh; line-height:1.5;
+    animation: fade-in .35s ease;
   }
+  @keyframes fade-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
   nav {
     display:flex; align-items:center; gap:22px; padding:16px 28px;
-    background:rgba(20,21,28,0.85); backdrop-filter: blur(10px);
+    background:rgba(20,21,28,0.75); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
     border-bottom:1px solid var(--border); position:sticky; top:0; z-index:10;
+    box-shadow: 0 4px 24px -10px rgba(0,0,0,0.6);
   }
   nav a {
     color:var(--muted); text-decoration:none; font-size:14px; font-weight:500;
@@ -206,19 +221,25 @@ STYLE = """
   }
   nav a:hover { color:#fff; background:var(--panel-2); }
   nav .brand {
-    font-weight:800; font-size:16px; letter-spacing:.6px; margin-right:auto;
+    font-family:var(--font-title); font-weight:700; font-size:18px; letter-spacing:1px; margin-right:auto;
     background:linear-gradient(135deg, var(--gold-2), var(--gold));
     -webkit-background-clip:text; background-clip:text; color:transparent;
+    text-shadow: 0 0 24px rgba(232,189,85,0.25);
   }
   main { max-width:1000px; margin:36px auto; padding:0 22px 70px; }
-  h1 { font-size:26px; margin:0 0 6px; font-weight:800; letter-spacing:-.3px; }
-  h2 { font-size:17px; color:#d7d8e6; margin-top:34px; margin-bottom:10px; font-weight:700; }
+  h1 { font-family:var(--font-title); font-size:28px; margin:0 0 6px; font-weight:700; letter-spacing:.3px; }
+  h2 { font-family:var(--font-title); font-size:18px; color:#d7d8e6; margin-top:34px; margin-bottom:10px; font-weight:700; letter-spacing:.2px; }
   .card {
+    position:relative; overflow:hidden;
     background:linear-gradient(180deg, var(--panel), var(--panel) 60%, var(--panel-2));
     border:1px solid var(--border); border-radius:16px; padding:22px 24px; margin:16px 0;
-    box-shadow: var(--shadow); transition: border-color .2s ease, transform .15s ease;
+    box-shadow: var(--shadow); transition: border-color .2s ease, transform .15s ease, box-shadow .2s ease;
   }
-  .card:hover { border-color:#3a3c4c; }
+  .card::before {
+    content:""; position:absolute; inset:0 0 auto 0; height:1px;
+    background:linear-gradient(90deg, transparent, rgba(232,189,85,0.5), transparent);
+  }
+  .card:hover { border-color:#3a3c4c; box-shadow: 0 14px 34px -12px rgba(0,0,0,0.65); }
   table { width:100%; border-collapse:collapse; margin-top:10px; }
   th, td { text-align:left; padding:12px 14px; border-bottom:1px solid var(--border); font-size:14px; vertical-align:middle; }
   th { color:var(--muted); font-weight:700; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
@@ -257,11 +278,8 @@ STYLE = """
     display:inline-flex; align-items:center; padding:4px 12px; border-radius:20px;
     font-size:12px; font-weight:700; white-space:nowrap; letter-spacing:.2px;
   }
-  .badge.recrue { background:#2a2b38; color:var(--muted); }
-  .badge.membre { background:rgba(126,200,227,0.14); color:#7ec8e3; }
+  .badge.malgache { background:rgba(126,200,227,0.14); color:#7ec8e3; }
   .badge.instructeur { background:rgba(95,208,176,0.14); color:#5fd0b0; }
-  .badge.admin { background:rgba(232,189,85,0.14); color:var(--gold-2); }
-  .badge.super_admin { background:rgba(224,126,200,0.14); color:#e07ec8; }
   .badge.proprietaire {
     background:linear-gradient(135deg, rgba(255,209,102,0.2), rgba(255,209,102,0.08));
     color:#ffd166; border:1px solid rgba(255,209,102,0.5);
@@ -281,8 +299,10 @@ STYLE = """
   .stat-card {
     background:linear-gradient(180deg, var(--panel), var(--panel-2));
     border:1px solid var(--border); border-radius:14px; padding:18px 20px; box-shadow:var(--shadow);
+    transition: transform .15s ease, border-color .15s ease;
   }
-  .stat-card .valeur { font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; }
+  .stat-card:hover { transform:translateY(-2px); border-color:rgba(232,189,85,0.4); }
+  .stat-card .valeur { font-family:var(--font-title); font-size:28px; font-weight:800; color:var(--gold-2); line-height:1.2; text-shadow:0 0 18px rgba(232,189,85,0.2); }
   .stat-card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-top:4px; }
 
   .log-entry {
@@ -308,7 +328,6 @@ def page_html(titre, corps, connecte=None, role=None):
         liens = []
         if niveau >= niveau_role("instructeur"):
             liens.append('<a href="/admin/serveurs">Serveurs</a>')
-        if niveau >= niveau_role("admin"):
             liens.append('<a href="/admin/comptes">Comptes</a>')
         if niveau >= niveau_role("proprietaire"):
             liens.append('<a href="/admin/dashboard">Tableau de bord</a>')
@@ -319,6 +338,7 @@ def page_html(titre, corps, connecte=None, role=None):
             liens.append('<a href="/admin/backup">Sauvegardes</a>')
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
+            liens.append('<a href="/mon-catalogue">Catalogue</a>')
         badge_icone = "👑 " if role == "proprietaire" else ""
         badge = f'<span class="badge {role}">{badge_icone}{ROLE_LABELS.get(role, role)}</span>' if role else ""
         nav_liens = "".join(liens) + f'<span class="muted">{connecte}</span>{badge}<a href="/deconnexion">Déconnexion</a>'
@@ -328,6 +348,10 @@ def page_html(titre, corps, connecte=None, role=None):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{titre} — Valerius</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚖️%3C/text%3E%3C/svg%3E">
 {STYLE}
 </head>
 <body>
@@ -349,6 +373,28 @@ def configurer_site(app, bot, deps):
 
     def connecte():
         return session.get("login")
+
+    def annoncer_maintenance(actif):
+        """Envoie un message dans le salon d'annonce dédié quand le mode
+        maintenance est activé ou désactivé depuis le site."""
+        channel_id = deps.get("salon_annonce_maintenance_id")
+        if not channel_id:
+            return
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            return
+        texte = (
+            "🛠️ **VALERIUS PASSE EN MAINTENANCE**\n"
+            "Le bot est temporairement indisponible le temps des réglages, merci de votre patience !"
+            if actif else
+            "✅ **FIN DE LA MAINTENANCE**\n"
+            "Valerius est de nouveau pleinement opérationnel."
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(channel.send(texte), bot.loop)
+            future.result(timeout=10)
+        except Exception:
+            pass
 
     def compte_connecte():
         login = connecte()
@@ -372,7 +418,7 @@ def configurer_site(app, bot, deps):
 
     def role_required(min_role):
         """Exige d'être connecté ET d'avoir au moins ce rôle dans la
-        hiérarchie recrue < membre < instructeur < admin < super_admin < proprietaire."""
+        hiérarchie malgache < instructeur < proprietaire."""
         def decorateur(f):
             @functools.wraps(f)
             def wrapper(*a, **kw):
@@ -426,7 +472,7 @@ def configurer_site(app, bot, deps):
             else:
                 comptes[login] = {
                     "password_hash": generate_password_hash(mdp),
-                    "role": "recrue",
+                    "role": "malgache",
                     "discord_id": discord_id,
                     "guild_id": guild_id,
                     "must_change_password": False
@@ -440,7 +486,7 @@ def configurer_site(app, bot, deps):
         corps = render_template_string("""
         <div class="card" style="max-width:440px;margin:60px auto;">
           <h1>Créer un compte</h1>
-          <p class="muted">Ton compte sera créé avec le rôle <strong>Recrue</strong>. Un administrateur pourra ensuite te faire progresser.</p>
+          <p class="muted">Ton compte sera créé avec le rôle <strong>Malgache</strong>. Un instructeur pourra ensuite te faire progresser.</p>
           {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
           {% if not guilds %}
           <div class="flash erreur">Le bot n'est connecté à aucun serveur pour l'instant. Réessaie plus tard.</div>
@@ -572,13 +618,13 @@ def configurer_site(app, bot, deps):
         </div>
         {% endfor %}
         """, guilds=guilds, super_admin=(compte.get("role") == "proprietaire"),
-             peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("admin")))
+             peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("instructeur")))
         return page_html("Serveurs", corps, connecte(), compte.get("role"))
 
-    # ---------- Catalogue de missions (admin et plus, scope serveur) ----------
+    # ---------- Catalogue de missions (instructeur et plus, scope serveur) ----------
 
     @app.route("/admin/missions/<int:guild_id>", methods=["GET", "POST"])
-    @role_required("admin")
+    @role_required("instructeur")
     def admin_missions(guild_id):
         compte = compte_connecte()
         if not guild_autorise(compte, guild_id):
@@ -670,29 +716,49 @@ def configurer_site(app, bot, deps):
             abort(403)
         missions_actives = deps["missions_actives"]
         message = None
+        erreur = None
         if request.method == "POST":
             joueur_id = int(request.form.get("joueur_id"))
-            statut = request.form.get("statut")
+            action = request.form.get("action", "statut")
             if guild_id in missions_actives and joueur_id in missions_actives[guild_id]:
-                m_info = missions_actives[guild_id][joueur_id]
-                profils = deps["charger_profils"](guild_id)
-                deps["initialiser_profil"](joueur_id, profils)
-                if statut == "succes":
-                    profils[str(joueur_id)]["total_reussies"] += 1
-                    deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Succès", m_info["cat"])
-                    message = "Mission marquée comme réussie."
+                if action == "temps":
+                    duree_texte = request.form.get("duree", "").strip()
+                    retirer = request.form.get("sens") == "retirer"
+                    if not duree_texte:
+                        erreur = "Indique une durée (ex : 2h, 1 jour)."
+                    else:
+                        delta = deps["extraire_duree"](duree_texte)
+                        m_info = missions_actives[guild_id][joueur_id]
+                        if retirer:
+                            m_info["date_fin"] -= delta
+                            m_info["duree_totale"] -= delta
+                        else:
+                            m_info["date_fin"] += delta
+                            m_info["duree_totale"] += delta
+                        deps["sauvegarder_log_disque"](f"⏱️ Temps {'retiré' if retirer else 'ajouté'} ({duree_texte}) sur la mission du joueur {joueur_id} depuis le site par {connecte()}.")
+                        message = f"{'Retiré' if retirer else 'Ajouté'} {duree_texte} avec succès."
                 else:
-                    profils[str(joueur_id)]["total_echouees"] += 1
-                    deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Échec", m_info["cat"])
-                    message = "Mission marquée comme échouée."
-                deps["sauvegarder_profils"](guild_id, profils)
-                del missions_actives[guild_id][joueur_id]
+                    statut = request.form.get("statut")
+                    m_info = missions_actives[guild_id][joueur_id]
+                    profils = deps["charger_profils"](guild_id)
+                    deps["initialiser_profil"](joueur_id, profils)
+                    if statut == "succes":
+                        profils[str(joueur_id)]["total_reussies"] += 1
+                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Succès", m_info["cat"])
+                        message = "Mission marquée comme réussie."
+                    else:
+                        profils[str(joueur_id)]["total_echouees"] += 1
+                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Échec", m_info["cat"])
+                        message = "Mission marquée comme échouée."
+                    deps["sauvegarder_profils"](guild_id, profils)
+                    del missions_actives[guild_id][joueur_id]
 
         actives = list(missions_actives.get(guild_id, {}).items())
         corps = render_template_string("""
         <h1>Missions en cours</h1>
         <p class="muted">Serveur {{ guild_id }} — {{ actives|length }} mission(s) active(s)</p>
         {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
         <p class="muted">⚠️ Ces actions mettent à jour les fichiers du bot mais n'envoient PAS de message dans Discord. Pour un suivi avec notifications, utilise les boutons du ticket ou les commandes slash.</p>
         {% if not actives %}<div class="card">Aucune mission en cours sur ce serveur.</div>{% endif %}
         {% for joueur_id, m in actives %}
@@ -706,19 +772,31 @@ def configurer_site(app, bot, deps):
             <div class="row">
               <form method="post" class="inline">
                 <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
+                <input type="hidden" name="action" value="statut">
                 <input type="hidden" name="statut" value="succes">
                 <button type="submit">✅ Marquer réussie</button>
               </form>
               <form method="post" class="inline">
                 <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
+                <input type="hidden" name="action" value="statut">
                 <input type="hidden" name="statut" value="echec">
                 <button class="danger" type="submit">❌ Marquer échouée</button>
               </form>
             </div>
           </div>
+          <form method="post" class="row" style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px;">
+            <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
+            <input type="hidden" name="action" value="temps">
+            <input name="duree" placeholder="ex : 2h, 1 jour, 30min" style="width:160px" required>
+            <select name="sens">
+              <option value="ajouter">➕ Ajouter</option>
+              <option value="retirer">➖ Retirer</option>
+            </select>
+            <button class="secondary" type="submit">Appliquer le temps</button>
+          </form>
         </div>
         {% endfor %}
-        """, actives=actives, message=message, guild_id=guild_id)
+        """, actives=actives, message=message, erreur=erreur, guild_id=guild_id)
         return page_html("Missions en cours", corps, connecte(), compte.get("role"))
 
     # ---------- Profils (instructeur et plus, scope serveur) ----------
@@ -730,16 +808,29 @@ def configurer_site(app, bot, deps):
         if not guild_autorise(compte, guild_id):
             abort(403)
         profils = deps["charger_profils"](guild_id)
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        noms = {}
+        if g:
+            for jid in profils.keys():
+                m = g.get_member(int(jid)) if jid.isdigit() else None
+                if m:
+                    noms[jid] = m.display_name
         corps = render_template_string("""
         <h1>Profils des joueurs</h1>
         <p class="muted">Serveur {{ guild_id }} — {{ profils|length }} profil(s)</p>
         {% if not profils %}<div class="card">Aucun profil enregistré sur ce serveur.</div>{% endif %}
         {% if profils %}
         <table>
-          <tr><th>Joueur (ID)</th><th>Réussies</th><th>Échouées</th><th></th></tr>
+          <tr><th>Joueur</th><th>Réussies</th><th>Échouées</th><th></th></tr>
           {% for jid, p in profils.items() %}
           <tr>
-            <td>{{ jid }}</td>
+            <td>
+              {% if noms.get(jid) %}
+              <strong style="font-size:15px;">{{ noms[jid] }}</strong><div class="muted" style="font-size:11px;">{{ jid }}</div>
+              {% else %}
+              {{ jid }}
+              {% endif %}
+            </td>
             <td>{{ p.total_reussies }}</td>
             <td>{{ p.total_echouees }}</td>
             <td><a class="btnlink" href="/admin/profils/{{ guild_id }}/{{ jid }}">Historique</a></td>
@@ -747,40 +838,146 @@ def configurer_site(app, bot, deps):
           {% endfor %}
         </table>
         {% endif %}
-        """, profils=profils, guild_id=guild_id)
+        """, profils=profils, guild_id=guild_id, noms=noms)
         return page_html("Profils", corps, connecte(), compte.get("role"))
 
-    @app.route("/admin/profils/<int:guild_id>/<joueur_id>")
+    @app.route("/admin/profils/<int:guild_id>/<joueur_id>", methods=["GET", "POST"])
     @role_required("instructeur")
     def admin_profil_detail(guild_id, joueur_id):
         compte = compte_connecte()
         if not guild_autorise(compte, guild_id):
             abort(403)
+        peut_modifier = niveau_role(compte.get("role")) >= niveau_role("instructeur")
+        message = None
+        erreur = None
+
+        if request.method == "POST":
+            if not peut_modifier:
+                abort(403)
+            profils = deps["charger_profils"](guild_id)
+            profil_courant = profils.get(str(joueur_id))
+            if not profil_courant:
+                abort(404)
+            action = request.form.get("action")
+
+            if action == "ajouter":
+                statut = request.form.get("statut", "Succès")
+                categorie = request.form.get("categorie", "commune")
+                texte = request.form.get("texte", "").strip()
+                if not texte:
+                    erreur = "Décris la mission à ajouter."
+                else:
+                    if statut == "Succès":
+                        profil_courant["total_reussies"] += 1
+                    else:
+                        profil_courant["total_echouees"] += 1
+                    deps["ajouter_historique"](int(joueur_id), profils, texte, statut, categorie)
+                    deps["sauvegarder_profils"](guild_id, profils)
+                    deps["sauvegarder_log_disque"](f"📝 Entrée ajoutée à l'historique du joueur {joueur_id} depuis le site par {connecte()}.")
+                    message = "Entrée ajoutée à l'historique."
+
+            elif action == "retirer":
+                index = int(request.form.get("index", -1))
+                hist = profil_courant["historique"]
+                if 0 <= index < len(hist):
+                    entree = hist.pop(index)
+                    if entree.get("statut") == "Succès":
+                        profil_courant["total_reussies"] = max(0, profil_courant["total_reussies"] - 1)
+                    else:
+                        profil_courant["total_echouees"] = max(0, profil_courant["total_echouees"] - 1)
+                    deps["sauvegarder_profils"](guild_id, profils)
+                    deps["sauvegarder_log_disque"](f"🗑️ Entrée retirée de l'historique du joueur {joueur_id} depuis le site par {connecte()}.")
+                    message = "Entrée retirée de l'historique."
+                else:
+                    erreur = "Entrée introuvable."
+
+            elif action == "reset":
+                profil_courant["total_reussies"] = 0
+                profil_courant["total_echouees"] = 0
+                profil_courant["historique"] = []
+                deps["sauvegarder_profils"](guild_id, profils)
+                deps["sauvegarder_log_disque"](f"♻️ Profil du joueur {joueur_id} réinitialisé depuis le site par {connecte()}.")
+                message = "Profil réinitialisé."
+
         profils = deps["charger_profils"](guild_id)
         profil = profils.get(str(joueur_id))
         if not profil:
             abort(404)
+
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        pseudo_joueur = None
+        if g and str(joueur_id).isdigit():
+            m = g.get_member(int(joueur_id))
+            if m:
+                pseudo_joueur = m.display_name
+
         corps = render_template_string("""
+        {% if pseudo_joueur %}
+        <h1 style="margin-bottom:2px;">{{ pseudo_joueur }}</h1>
+        <p class="muted" style="font-size:11px;margin-top:0;">ID : {{ joueur_id }}</p>
+        {% else %}
         <h1>Historique — Joueur {{ joueur_id }}</h1>
+        {% endif %}
         <p class="muted">Serveur {{ guild_id }} — {{ profil.total_reussies }} réussies / {{ profil.total_echouees }} échouées</p>
+        {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        {% if peut_modifier %}
+        <div class="card">
+          <h2 style="margin-top:0">Ajouter une entrée manuellement</h2>
+          <form method="post" class="row">
+            <input type="hidden" name="action" value="ajouter">
+            <select name="statut">
+              <option value="Succès">Succès</option>
+              <option value="Échec">Échec</option>
+            </select>
+            <select name="categorie">
+              <option value="commune">Commune</option>
+              <option value="moyenne">Moyenne</option>
+              <option value="difficile">Difficile</option>
+              <option value="royal">Royal</option>
+            </select>
+            <input name="texte" placeholder="Description de la mission" style="flex:1;min-width:220px" required>
+            <button type="submit">Ajouter</button>
+          </form>
+        </div>
+
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>Zone dangereuse</strong><div class="muted">Remet à zéro tout l'historique et les compteurs de ce joueur.</div></div>
+          <form method="post" class="inline" onsubmit="return confirm('Réinitialiser TOUT le profil de ce joueur ? Action irréversible.')">
+            <input type="hidden" name="action" value="reset">
+            <button class="danger" type="submit">Réinitialiser ce profil</button>
+          </form>
+        </div>
+        {% endif %}
+
         <table>
-          <tr><th>Date</th><th>Catégorie</th><th>Mission</th><th>Statut</th></tr>
+          <tr><th>Date</th><th>Catégorie</th><th>Mission</th><th>Statut</th>{% if peut_modifier %}<th></th>{% endif %}</tr>
           {% for h in profil.historique %}
           <tr>
             <td>{{ h.date }}</td>
             <td>{{ h.categorie }}</td>
             <td>{{ h.texte }}</td>
             <td>{{ h.statut }}</td>
+            {% if peut_modifier %}
+            <td>
+              <form method="post" class="inline" onsubmit="return confirm('Retirer cette entrée de l\\'historique ?')">
+                <input type="hidden" name="action" value="retirer">
+                <input type="hidden" name="index" value="{{ loop.index0 }}">
+                <button class="danger" type="submit">Retirer</button>
+              </form>
+            </td>
+            {% endif %}
           </tr>
           {% endfor %}
         </table>
-        """, profil=profil, joueur_id=joueur_id, guild_id=guild_id)
+        """, profil=profil, joueur_id=joueur_id, guild_id=guild_id, peut_modifier=peut_modifier, message=message, erreur=erreur, pseudo_joueur=pseudo_joueur)
         return page_html("Historique", corps, connecte(), compte.get("role"))
 
-    # ---------- Admin : comptes du site (admin et plus) ----------
+    # ---------- Admin : comptes du site (instructeur et plus) ----------
 
     @app.route("/admin/comptes", methods=["GET", "POST"])
-    @role_required("admin")
+    @role_required("instructeur")
     def admin_comptes():
         message = None
         erreur = None
@@ -788,9 +985,9 @@ def configurer_site(app, bot, deps):
         acteur = compte_connecte()
         acteur_role = acteur.get("role")
         # Seul un Propriétaire a le pouvoir total : attribuer n'importe quel
-        # rôle (y compris Propriétaire/Super Modo) et choisir n'importe quel
-        # serveur. Un Super Modo, lui, reste cantonné à son propre serveur,
-        # exactement comme un admin.
+        # rôle (y compris Propriétaire) et choisir n'importe quel serveur.
+        # Un instructeur reste cantonné à son propre serveur, et ne peut
+        # attribuer que des rôles strictement inférieurs au sien.
         acteur_super = acteur_role == "proprietaire"
 
         def peut_gerer(role_cible):
@@ -805,7 +1002,7 @@ def configurer_site(app, bot, deps):
 
             if action == "creer":
                 login = request.form.get("login", "").strip()
-                role_demande = request.form.get("role", "recrue")
+                role_demande = request.form.get("role", "malgache")
                 discord_id = request.form.get("discord_id", "").strip() or None
                 guild_id = request.form.get("guild_id", "").strip() or None
                 if not acteur_super:
@@ -1130,10 +1327,12 @@ def configurer_site(app, bot, deps):
             elif action == "maintenance_on":
                 deps["definir_maintenance"](True)
                 deps["sauvegarder_log_disque"](f"🛠️ Mode maintenance ACTIVÉ depuis le site par {connecte()}.")
+                annoncer_maintenance(True)
                 message = "Mode maintenance activé : le bot ne répond plus qu'au Propriétaire."
             elif action == "maintenance_off":
                 deps["definir_maintenance"](False)
                 deps["sauvegarder_log_disque"](f"✅ Mode maintenance DÉSACTIVÉ depuis le site par {connecte()}.")
+                annoncer_maintenance(False)
                 message = "Mode maintenance désactivé : le bot répond de nouveau normalement."
 
         code_actuel = deps["charger_code_verrou"]()
@@ -1286,7 +1485,7 @@ def configurer_site(app, bot, deps):
                         membre = g.get_member(int(joueur_id)) if joueur_id.isdigit() else None
                         resultats.append({
                             "guild": g, "profil": profil,
-                            "nom": membre.display_name if membre else joueur_id
+                            "nom": membre.display_name if membre else None
                         })
 
         corps = render_template_string("""
@@ -1304,7 +1503,12 @@ def configurer_site(app, bot, deps):
         {% for r in resultats %}
         <div class="card row" style="justify-content:space-between;">
           <div>
-            <strong>{{ r.nom }}</strong> — {{ r.guild.name }}
+            {% if r.nom %}
+            <strong style="font-size:15px;">{{ r.nom }}</strong><div class="muted" style="font-size:11px;">{{ joueur_id }}</div>
+            {% else %}
+            <strong>{{ joueur_id }}</strong>
+            {% endif %}
+            — {{ r.guild.name }}
             <div class="muted">{{ r.profil.total_reussies }} réussie(s) — {{ r.profil.total_echouees }} échouée(s)</div>
           </div>
           <a class="btnlink" href="/admin/profils/{{ r.guild.id }}/{{ joueur_id }}">Voir l'historique</a>
@@ -1313,7 +1517,7 @@ def configurer_site(app, bot, deps):
         """, resultats=resultats, joueur_id=joueur_id)
         return page_html("Rechercher un joueur", corps, connecte(), "proprietaire")
 
-    # ---------- Utilisateur (recrue/membre) : son profil uniquement ----------
+    # ---------- Utilisateur (malgache) : son profil uniquement ----------
 
     @app.route("/mon-profil")
     @login_required
@@ -1351,3 +1555,33 @@ def configurer_site(app, bot, deps):
         {% endif %}
         """, profil=profil)
         return page_html("Mon profil", corps, connecte(), compte.get("role"))
+
+    @app.route("/mon-catalogue")
+    @login_required
+    def mon_catalogue():
+        compte = compte_connecte()
+        if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
+            return redirect(url_for("admin_serveurs"))
+        guild_id = compte.get("guild_id")
+        structure = deps["charger_missions_fichier"](int(guild_id)) if guild_id else None
+        corps = render_template_string("""
+        <h1>Catalogue des missions</h1>
+        {% if not guild_id %}
+          <div class="card">Ton compte n'est relié à aucun serveur pour l'instant. Demande à un instructeur de vérifier ton profil.</div>
+        {% else %}
+          {% for cat, missions in structure.items() %}
+          <h2>{{ cat|capitalize }} ({{ missions|length }})</h2>
+          <div class="card">
+            {% if not missions %}<p class="muted">Aucune mission disponible.</p>{% endif %}
+            {% if missions %}
+            <table>
+            {% for m in missions %}
+              <tr><td>{{ loop.index }}</td><td>{{ m.texte }}</td><td class="muted">Délai : {{ m.delai }}</td></tr>
+            {% endfor %}
+            </table>
+            {% endif %}
+          </div>
+          {% endfor %}
+        {% endif %}
+        """, structure=structure, guild_id=guild_id)
+        return page_html("Catalogue", corps, connecte(), compte.get("role"))
