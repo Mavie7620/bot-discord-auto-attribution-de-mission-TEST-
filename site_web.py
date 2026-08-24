@@ -439,7 +439,7 @@ def page_html(titre, corps, connecte=None, role=None):
 </head>
 <body>
 <div id="grille-curseur"></div>
-<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/static/drapeau.jpg" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
+<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/static/drapeau.png" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
 <main>
 {corps}
 </main>
@@ -618,7 +618,7 @@ def page_accueil_pays(connecte=None, role=None):
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="icon" href="/static/drapeau.jpg">
+<link rel="icon" href="/static/drapeau.png">
 {STYLE}
 {STYLE_PAYS}
 </head>
@@ -626,7 +626,7 @@ def page_accueil_pays(connecte=None, role=None):
 <div id="grille-curseur"></div>
 {nav_html}
 <div class="pays-body">
-  <img class="pays-drapeau" src="/static/drapeau.jpg" alt="Drapeau de Madagascar">
+  <img class="pays-drapeau" src="/static/drapeau.png" alt="Drapeau de Madagascar">
   <div class="pays-eyebrow">Portail officiel</div>
   <h1 class="pays-titre">MADAGASCAR</h1>
   <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
@@ -769,7 +769,7 @@ def configurer_site(app, bot, deps):
                 session.clear()
                 session["login"] = login
                 session.permanent = True
-                return redirect(url_for("mon_profil"))
+                return redirect(url_for("racine"))
         guilds = list(bot.guilds)
         corps = render_template_string("""
         <div class="card" style="max-width:440px;margin:60px auto;">
@@ -814,9 +814,7 @@ def configurer_site(app, bot, deps):
                 session.permanent = True
                 if compte.get("must_change_password"):
                     return redirect(url_for("changer_mot_de_passe"))
-                if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
-                    return redirect(url_for("admin_serveurs"))
-                return redirect(url_for("mon_profil"))
+                return redirect(url_for("racine"))
             erreur = "Identifiant ou mot de passe incorrect."
         corps = render_template_string("""
         <div class="card" style="max-width:360px;margin:60px auto;">
