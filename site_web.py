@@ -42,7 +42,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 import discord
-from flask import request, redirect, url_for, session, send_file, abort, render_template_string
+from flask import request, redirect, url_for, session, send_file, abort, render_template_string, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 
 COMPTES_FILE = "valerius_comptes.json"
@@ -466,6 +466,31 @@ STYLE = """
   .pill { display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:20px; font-size:12px; font-weight:700; }
   .pill.on { background:rgba(63,214,140,0.14); color:#8bf0c0; }
   .pill.off { background:rgba(229,9,20,0.16); color:#ff9da1; }
+  .pill.attente { background:rgba(232,189,85,0.16); color:var(--gold-2); }
+
+  /* ---- Missions en cours : chrono & indicateur temps réel ---- */
+  .live-indicateur { display:inline-flex; align-items:center; font-size:12.5px; color:var(--muted); font-weight:600; }
+  .live-dot {
+    display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:var(--green); margin-right:7px; flex-shrink:0;
+    animation: live-pulse 1.8s ease-in-out infinite;
+  }
+  @keyframes live-pulse {
+    0% { box-shadow:0 0 0 0 rgba(63,214,140,0.55); }
+    70% { box-shadow:0 0 0 8px rgba(63,214,140,0); }
+    100% { box-shadow:0 0 0 0 rgba(63,214,140,0); }
+  }
+  .chrono { font-variant-numeric:tabular-nums; font-weight:800; font-size:14px; letter-spacing:.2px; }
+  .chrono.ok { color:var(--green); }
+  .chrono.warn { color:var(--gold-2); }
+  .chrono.retard { color:#ff9da1; animation:chrono-pulse 1.3s ease-in-out infinite; }
+  @keyframes chrono-pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+  .mission-carte { transition: background-color .4s ease; }
+  .mission-carte.nouvelle { animation: mission-apparait .6s ease; }
+  @keyframes mission-apparait {
+    from { opacity:0; transform:translateY(-6px); background-color:rgba(232,189,85,0.1); }
+    to { opacity:1; transform:none; }
+  }
 
   #grille-curseur {
     position: fixed; inset: 0; z-index: 0; pointer-events: none;
@@ -1289,6 +1314,48 @@ def configurer_site(app, bot, deps):
 
     # ---------- Missions en cours (instructeur et plus, scope serveur) ----------
 
+    def _serialiser_mission_active(guild, joueur_id, m):
+        """Transforme une mission active (dict interne du bot) en dict
+        JSON-compatible, réutilisé par la page et par l'API temps réel."""
+        membre = guild.get_member(joueur_id) if guild else None
+        return {
+            "joueur_id": joueur_id,
+            "nom": membre.display_name if membre else None,
+            "texte": m["texte"],
+            "cat": m["cat"],
+            "date_debut": int(m["date_debut"].timestamp()),
+            "date_fin": int(m["date_fin"].timestamp()),
+            "duree_totale": m["duree_totale"].total_seconds(),
+            "en_attente": bool(m.get("en_attente", False)),
+        }
+
+    @app.route("/admin/api/missions-actives/<int:guild_id>")
+    @role_required("instructeur")
+    def api_missions_actives(guild_id):
+        """Endpoint JSON interrogé en continu par la page 'Missions en
+        cours' pour l'affichage en temps réel (ajout/fin de mission
+        détectés sans recharger la page) et pour le chrono de chacune."""
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
+        missions_actives = deps["missions_actives"]
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        actives = [
+            _serialiser_mission_active(g, joueur_id, m)
+            for joueur_id, m in missions_actives.get(guild_id, {}).items()
+        ]
+        actives.sort(key=lambda x: x["date_fin"])
+        reponse = jsonify({
+            "actives": actives,
+            "count": len(actives),
+            "serveur_temps": int(datetime.now().timestamp()),
+        })
+        # Empêche le navigateur (ou un éventuel cache intermédiaire) de
+        # resservir une ancienne réponse à cet endpoint interrogé en
+        # continu par le JS de la page "Missions en cours".
+        reponse.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return reponse
+
     @app.route("/admin/missions-actives/<int:guild_id>", methods=["GET", "POST"])
     @role_required("instructeur")
     def admin_missions_actives(guild_id):
@@ -1298,10 +1365,15 @@ def configurer_site(app, bot, deps):
         missions_actives = deps["missions_actives"]
         message = None
         erreur = None
+        g = discord.utils.get(bot.guilds, id=guild_id)
+
         if request.method == "POST":
             joueur_id = int(request.form.get("joueur_id"))
             action = request.form.get("action", "statut")
             if guild_id in missions_actives and joueur_id in missions_actives[guild_id]:
+                m_info = missions_actives[guild_id][joueur_id]
+                channel = bot.get_channel(m_info["channel_id"])
+
                 if action == "temps":
                     duree_texte = request.form.get("duree", "").strip()
                     retirer = request.form.get("sens") == "retirer"
@@ -1309,7 +1381,6 @@ def configurer_site(app, bot, deps):
                         erreur = "Indique une durée (ex : 2h, 1 jour)."
                     else:
                         delta = deps["extraire_duree"](duree_texte)
-                        m_info = missions_actives[guild_id][joueur_id]
                         if retirer:
                             m_info["date_fin"] -= delta
                             m_info["duree_totale"] -= delta
@@ -1318,67 +1389,243 @@ def configurer_site(app, bot, deps):
                             m_info["duree_totale"] += delta
                         deps["sauvegarder_log_disque"](f"⏱️ Temps {'retiré' if retirer else 'ajouté'} ({duree_texte}) sur la mission du joueur {joueur_id} depuis le site par {connecte()}.")
                         message = f"{'Retiré' if retirer else 'Ajouté'} {duree_texte} avec succès."
+
+                        # Prévient le ticket + le salon de validation qu'un
+                        # instructeur a changé le temps depuis le site web.
+                        timestamp_fin = int(m_info["date_fin"].timestamp())
+                        texte_notif = (
+                            f"⏱️ **Temps {'retiré' if retirer else 'ajouté'} par un instructeur depuis le site web** : {duree_texte}.\n"
+                            f"Nouvelle échéance : <t:{timestamp_fin}:R> (<t:{timestamp_fin}:f>)."
+                        )
+                        if channel:
+                            try:
+                                future = asyncio.run_coroutine_threadsafe(channel.send(texte_notif), bot.loop)
+                                future.result(timeout=10)
+                            except Exception:
+                                pass
+                        if g:
+                            try:
+                                future = asyncio.run_coroutine_threadsafe(
+                                    deps["envoyer_double_notification"](g, "", f"⏱️ {connecte()} a {'retiré' if retirer else 'ajouté'} {duree_texte} sur la mission de <@{joueur_id}> depuis le site web."),
+                                    bot.loop,
+                                )
+                                future.result(timeout=10)
+                            except Exception:
+                                pass
                 else:
                     statut = request.form.get("statut")
-                    m_info = missions_actives[guild_id][joueur_id]
-                    profils = deps["charger_profils"](guild_id)
-                    deps["initialiser_profil"](joueur_id, profils)
-                    duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
-                    if statut == "succes":
-                        profils[str(joueur_id)]["total_reussies"] += 1
-                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes)
-                        message = "Mission marquée comme réussie."
+                    if not channel:
+                        erreur = "Salon du ticket introuvable (peut-être déjà supprimé) : action annulée."
                     else:
-                        profils[str(joueur_id)]["total_echouees"] += 1
-                        deps["ajouter_historique"](joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
-                        message = "Mission marquée comme échouée."
-                    deps["sauvegarder_profils"](guild_id, profils)
-                    del missions_actives[guild_id][joueur_id]
+                        try:
+                            if statut == "succes":
+                                future = asyncio.run_coroutine_threadsafe(deps["action_accepter_mission"](joueur_id, channel), bot.loop)
+                                message = "Mission marquée comme réussie."
+                            else:
+                                future = asyncio.run_coroutine_threadsafe(deps["action_refuser_mission"](joueur_id, channel), bot.loop)
+                                message = "Mission marquée comme échouée."
+                            future.result(timeout=10)
+                            deps["sauvegarder_log_disque"](f"⚖️ Mission du joueur {joueur_id} marquée '{statut}' depuis le site par {connecte()}.")
+                        except Exception as e:
+                            erreur = f"Erreur lors de la notification Discord : {e}"
+        actives = [
+            _serialiser_mission_active(g, joueur_id, m)
+            for joueur_id, m in missions_actives.get(guild_id, {}).items()
+        ]
+        actives.sort(key=lambda x: x["date_fin"])
+        emojis_cat = {"commune": "🟢", "moyenne": "🔵", "difficile": "🟠", "royal": "🔴"}
 
-        actives = list(missions_actives.get(guild_id, {}).items())
         corps = render_template_string("""
-        <h1>Missions en cours</h1>
-        <p class="muted">Serveur {{ guild_id }} — {{ actives|length }} mission(s) active(s)</p>
+        <div class="row" style="justify-content:space-between;align-items:flex-start;">
+          <div>
+            <h1>Missions en cours</h1>
+            <p class="muted">Serveur {{ guild_id }} — <span id="compteur-total">{{ actives|length }}</span> mission(s) active(s)</p>
+          </div>
+          <div style="text-align:right;">
+            <span class="live-indicateur"><span class="live-dot"></span>Temps réel</span>
+            <div class="muted" style="font-size:11px;margin-top:4px;">Actualisé <span id="dernier-refresh">à l'instant</span></div>
+          </div>
+        </div>
         {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
         {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
-        <p class="muted">⚠️ Ces actions mettent à jour les fichiers du bot mais n'envoient PAS de message dans Discord. Pour un suivi avec notifications, utilise les boutons du ticket ou les commandes slash.</p>
-        {% if not actives %}<div class="card">Aucune mission en cours sur ce serveur.</div>{% endif %}
-        {% for joueur_id, m in actives %}
-        <div class="card">
-          <div class="row" style="justify-content:space-between;">
+        <p class="muted">ℹ️ Les actions ci-dessous mettent à jour les fichiers du bot ET envoient un message dans le ticket Discord du joueur (ainsi que dans le salon de validation). La liste et les chronos se mettent à jour tout seuls, inutile de recharger la page.</p>
+
+        <div id="missions-container">
+        {% for m in actives %}
+        <div class="card mission-carte" id="mission-{{ m.joueur_id }}" data-joueur="{{ m.joueur_id }}" data-fin="{{ m.date_fin }}" data-debut="{{ m.date_debut }}" data-duree="{{ m.duree_totale }}">
+          <div class="row" style="justify-content:space-between;align-items:flex-start;">
             <div>
-              <strong>Joueur {{ joueur_id }}</strong> — <span class="muted">{{ m.cat }}</span>
-              <div>{{ m.texte }}</div>
-              <div class="muted">Fin prévue : {{ m.date_fin.strftime('%d/%m/%Y %H:%M') }}{% if m.en_attente %} · en attente de validation{% endif %}</div>
+              <strong>{% if m.nom %}{{ m.nom }}{% else %}Joueur {{ m.joueur_id }}{% endif %}</strong>
+              <span class="muted">· {{ m.joueur_id }}</span>
+              <span class="muted">— {{ emojis_cat.get(m.cat, "📜") }} {{ m.cat|capitalize }}</span>
+              {% if m.en_attente %}<span class="pill attente">⏳ En attente de validation</span>{% endif %}
+              <div style="margin-top:4px;">{{ m.texte }}</div>
             </div>
+            <div style="text-align:right;">
+              <div class="chrono" data-chrono="{{ m.joueur_id }}">--</div>
+              <div class="muted" style="font-size:11px;margin-top:2px;" data-fin-lisible="{{ m.joueur_id }}"></div>
+            </div>
+          </div>
+          <div class="row" style="justify-content:space-between;margin-top:14px;border-top:1px solid var(--border);padding-top:14px;">
             <div class="row">
               <form method="post" class="inline">
-                <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
+                <input type="hidden" name="joueur_id" value="{{ m.joueur_id }}">
                 <input type="hidden" name="action" value="statut">
                 <input type="hidden" name="statut" value="succes">
                 <button type="submit">✅ Marquer réussie</button>
               </form>
               <form method="post" class="inline">
-                <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
+                <input type="hidden" name="joueur_id" value="{{ m.joueur_id }}">
                 <input type="hidden" name="action" value="statut">
                 <input type="hidden" name="statut" value="echec">
                 <button class="danger" type="submit">❌ Marquer échouée</button>
               </form>
             </div>
+            <form method="post" class="row">
+              <input type="hidden" name="joueur_id" value="{{ m.joueur_id }}">
+              <input type="hidden" name="action" value="temps">
+              <input name="duree" placeholder="ex : 2h, 1 jour, 30min" style="width:160px" required>
+              <select name="sens">
+                <option value="ajouter">➕ Ajouter</option>
+                <option value="retirer">➖ Retirer</option>
+              </select>
+              <button class="secondary" type="submit">Appliquer le temps</button>
+            </form>
           </div>
-          <form method="post" class="row" style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px;">
-            <input type="hidden" name="joueur_id" value="{{ joueur_id }}">
-            <input type="hidden" name="action" value="temps">
-            <input name="duree" placeholder="ex : 2h, 1 jour, 30min" style="width:160px" required>
-            <select name="sens">
-              <option value="ajouter">➕ Ajouter</option>
-              <option value="retirer">➖ Retirer</option>
-            </select>
-            <button class="secondary" type="submit">Appliquer le temps</button>
-          </form>
         </div>
         {% endfor %}
-        """, actives=actives, message=message, erreur=erreur, guild_id=guild_id)
+        </div>
+        <div id="missions-vide" class="card" {% if actives %}style="display:none;"{% endif %}>Aucune mission en cours sur ce serveur.</div>
+
+        <script>
+        (function () {
+          // IMPORTANT : les ID Discord ("snowflakes") dépassent la limite
+          // des entiers exacts en JavaScript (Number.MAX_SAFE_INTEGER).
+          // Les embarquer comme nombre JS les fait arrondir silencieusement,
+          // ce qui envoie un guild_id légèrement faux à l'API et fait
+          // disparaître les missions. On les garde donc en chaîne partout.
+          var GUILD_ID = "{{ guild_id }}";
+          var EMOJIS_CAT = {"commune": "🟢", "moyenne": "🔵", "difficile": "🟠", "royal": "🔴"};
+          var conteneur = document.getElementById("missions-container");
+          var videMsg = document.getElementById("missions-vide");
+          var totalEl = document.getElementById("compteur-total");
+          var refreshEl = document.getElementById("dernier-refresh");
+
+          function echapper(txt) {
+            var d = document.createElement("div");
+            d.textContent = txt == null ? "" : String(txt);
+            return d.innerHTML;
+          }
+
+          function formatDuree(secondes) {
+            var neg = secondes < 0;
+            secondes = Math.abs(Math.round(secondes));
+            var j = Math.floor(secondes / 86400); secondes -= j * 86400;
+            var h = Math.floor(secondes / 3600); secondes -= h * 3600;
+            var m = Math.floor(secondes / 60); secondes -= m * 60;
+            var s = secondes;
+            var parts = [];
+            if (j) parts.push(j + "j");
+            if (h || j) parts.push(h + "h");
+            parts.push(m + "min");
+            parts.push(s + "s");
+            var texte = parts.join(" ");
+            return neg ? "⏰ En retard de " + texte : texte + " restant";
+          }
+
+          function majChronos() {
+            var maintenant = Date.now() / 1000;
+            var cartes = conteneur.querySelectorAll(".mission-carte");
+            cartes.forEach(function (carte) {
+              var fin = parseFloat(carte.getAttribute("data-fin"));
+              var debut = parseFloat(carte.getAttribute("data-debut"));
+              var duree = parseFloat(carte.getAttribute("data-duree")) || (fin - debut) || 1;
+              var restant = fin - maintenant;
+              var joueurId = carte.getAttribute("data-joueur");
+              var chronoEl = carte.querySelector('[data-chrono="' + joueurId + '"]');
+              var finLisibleEl = carte.querySelector('[data-fin-lisible="' + joueurId + '"]');
+              if (!chronoEl) return;
+              chronoEl.textContent = formatDuree(restant);
+              chronoEl.classList.remove("ok", "warn", "retard");
+              var ratio = restant / duree;
+              if (restant < 0) chronoEl.classList.add("retard");
+              else if (ratio < 0.25) chronoEl.classList.add("warn");
+              else chronoEl.classList.add("ok");
+              if (finLisibleEl) {
+                var dFin = new Date(fin * 1000);
+                finLisibleEl.textContent = "Fin prévue : " + dFin.toLocaleDateString("fr-FR") + " " + dFin.toLocaleTimeString("fr-FR", {hour: "2-digit", minute: "2-digit"});
+              }
+            });
+          }
+
+          function construireCarte(m) {
+            var emoji = EMOJIS_CAT[m.cat] || "📜";
+            var nomAffiche = m.nom ? echapper(m.nom) : "Joueur " + m.joueur_id;
+            var pillAttente = m.en_attente ? '<span class="pill attente">⏳ En attente de validation</span>' : "";
+            return (
+              '<div class="card mission-carte nouvelle" id="mission-' + m.joueur_id + '" data-joueur="' + m.joueur_id + '" data-fin="' + m.date_fin + '" data-debut="' + m.date_debut + '" data-duree="' + m.duree_totale + '">' +
+                '<div class="row" style="justify-content:space-between;align-items:flex-start;">' +
+                  '<div>' +
+                    '<strong>' + nomAffiche + '</strong> <span class="muted">· ' + m.joueur_id + '</span>' +
+                    ' <span class="muted">— ' + emoji + ' ' + echapper(m.cat.charAt(0).toUpperCase() + m.cat.slice(1)) + '</span>' +
+                    pillAttente +
+                    '<div style="margin-top:4px;">' + echapper(m.texte) + '</div>' +
+                  '</div>' +
+                  '<div style="text-align:right;">' +
+                    '<div class="chrono" data-chrono="' + m.joueur_id + '">--</div>' +
+                    '<div class="muted" style="font-size:11px;margin-top:2px;" data-fin-lisible="' + m.joueur_id + '"></div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="row" style="justify-content:space-between;margin-top:14px;border-top:1px solid var(--border);padding-top:14px;">' +
+                  '<div class="row">' +
+                    '<form method="post" class="inline"><input type="hidden" name="joueur_id" value="' + m.joueur_id + '"><input type="hidden" name="action" value="statut"><input type="hidden" name="statut" value="succes"><button type="submit">✅ Marquer réussie</button></form>' +
+                    '<form method="post" class="inline"><input type="hidden" name="joueur_id" value="' + m.joueur_id + '"><input type="hidden" name="action" value="statut"><input type="hidden" name="statut" value="echec"><button class="danger" type="submit">❌ Marquer échouée</button></form>' +
+                  '</div>' +
+                  '<form method="post" class="row">' +
+                    '<input type="hidden" name="joueur_id" value="' + m.joueur_id + '">' +
+                    '<input type="hidden" name="action" value="temps">' +
+                    '<input name="duree" placeholder="ex : 2h, 1 jour, 30min" style="width:160px" required>' +
+                    '<select name="sens"><option value="ajouter">➕ Ajouter</option><option value="retirer">➖ Retirer</option></select>' +
+                    '<button class="secondary" type="submit">Appliquer le temps</button>' +
+                  '</form>' +
+                '</div>' +
+              '</div>'
+            );
+          }
+
+          function focusDansConteneur() {
+            var actif = document.activeElement;
+            return actif && conteneur.contains(actif) && (actif.tagName === "INPUT" || actif.tagName === "SELECT" || actif.tagName === "TEXTAREA");
+          }
+
+          function actualiser() {
+            if (focusDansConteneur()) return; // on ne dérange pas quelqu'un en train de remplir un formulaire
+            fetch("/admin/api/missions-actives/" + GUILD_ID, {headers: {"X-Requested-With": "XMLHttpRequest"}})
+              .then(function (r) { return r.ok ? r.json() : null; })
+              .then(function (data) {
+                if (!data) return;
+                var idsActuels = Array.prototype.map.call(conteneur.querySelectorAll(".mission-carte"), function (c) { return c.getAttribute("data-joueur"); });
+                var idsNouveaux = data.actives.map(function (m) { return String(m.joueur_id); });
+                var identique = idsActuels.length === idsNouveaux.length && idsActuels.every(function (id, i) { return id === idsNouveaux[i]; });
+
+                if (!identique) {
+                  conteneur.innerHTML = data.actives.map(construireCarte).join("");
+                  videMsg.style.display = data.actives.length ? "none" : "block";
+                }
+                totalEl.textContent = data.count;
+                majChronos();
+                var maintenant = new Date();
+                refreshEl.textContent = maintenant.toLocaleTimeString("fr-FR", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+              })
+              .catch(function () { /* silencieux : on retentera au prochain cycle */ });
+          }
+
+          majChronos();
+          setInterval(majChronos, 1000);
+          setInterval(actualiser, 6000);
+        })();
+        </script>
+        """, actives=actives, message=message, erreur=erreur, guild_id=guild_id, emojis_cat=emojis_cat)
         return page_html("Missions en cours", corps, connecte(), compte.get("role"))
 
     # ---------- Profils (instructeur et plus, scope serveur) ----------

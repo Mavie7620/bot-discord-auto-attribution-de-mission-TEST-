@@ -7,6 +7,7 @@ import os
 import re
 import json
 import asyncio
+import threading
 from threading import Thread
 from flask import Flask
 from datetime import datetime, timedelta
@@ -142,6 +143,32 @@ def choisir_mission_sans_repetition(guild_id, joueur_id, missions_liste, delai=D
     fraiches = [m for m in missions_liste if not mission_recemment_donnee(guild_id, joueur_id, m["texte"], delai)]
     return random.choice(fraiches) if fraiches else random.choice(missions_liste)
 
+# ================= MISSION À REFAIRE (échec / abandon) =================
+# Quand une mission échoue ou est abandonnée, on la mémorise ici pour ce
+# joueur/serveur. Tant qu'elle n'est pas réussie, la prochaine ouverture de
+# ticket lui réattribue automatiquement CETTE mission (peu importe le
+# bouton de catégorie cliqué) au lieu d'un tirage aléatoire.
+
+def definir_mission_a_refaire(guild_id, joueur_id, texte, delai_texte, cat):
+    profils = charger_profils(guild_id)
+    initialiser_profil(joueur_id, profils)
+    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": texte, "delai": delai_texte, "cat": cat}
+    sauvegarder_profils(guild_id, profils)
+
+def obtenir_mission_a_refaire(guild_id, joueur_id):
+    profils = charger_profils(guild_id)
+    profil = profils.get(str(joueur_id))
+    if not profil:
+        return None
+    return profil.get("mission_a_refaire")
+
+def effacer_mission_a_refaire(guild_id, joueur_id):
+    profils = charger_profils(guild_id)
+    profil = profils.get(str(joueur_id))
+    if profil and "mission_a_refaire" in profil:
+        del profil["mission_a_refaire"]
+        sauvegarder_profils(guild_id, profils)
+
 def extraire_duree(delai_texte):
     """Parse une durée à partir d'un texte libre.
     Accepte aussi bien les formats compacts ("2h", "3j", "45min")
@@ -200,6 +227,13 @@ def formater_duree(delta):
     return " ".join(parts)
 
 missions_actives = {}
+
+# Verrou partagé entre le thread Flask (site web) et le thread asyncio du
+# bot : les deux threads peuvent lire/modifier missions_actives en même
+# temps, ce qui n'est pas garanti thread-safe par défaut en Python.
+# Toute suppression/modification de missions_actives depuis site_web.py
+# ou depuis la boucle d'expiration automatique doit passer par ce verrou.
+verrou_missions = threading.Lock()
 
 TEXTE_ECHEC = (
     "⚖️ **[ ORDRE DE MISSION ÉCHOUÉ ]** ⚖️ \n"
@@ -688,6 +722,9 @@ async def action_accepter_mission(joueur_id, channel):
         profils[str(joueur_id)]["total_reussies"] += 1
         duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
         ajouter_historique(joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes)
+        # Mission enfin réussie : on efface le "à refaire" s'il y en avait un.
+        if "mission_a_refaire" in profils.get(str(joueur_id), {}):
+            del profils[str(joueur_id)]["mission_a_refaire"]
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
         
@@ -708,6 +745,9 @@ async def action_refuser_mission(joueur_id, channel):
         profils[str(joueur_id)]["total_echouees"] += 1
         duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
         ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
+        # Mission échouée/abandonnée/refusée : on la mémorise pour que le
+        # joueur retombe automatiquement dessus à sa prochaine tentative.
+        profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"]}
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
         
@@ -772,59 +812,82 @@ async def gerer_expiration_automatique(guild, channel_id, joueur_id):
 @tasks.loop(seconds=1)
 async def verifier_temps_missions():
     maintenant = datetime.now()
-    
+
     for guild_id, j_dict in list(missions_actives.items()):
         guild = bot.get_guild(guild_id)
         if not guild: continue
         missions_a_retirer = []
 
         for joueur_id, m_info in list(j_dict.items()):
-            if m_info.get("en_attente", False): continue
-            
-            channel = bot.get_channel(m_info["channel_id"])
-            if not channel: continue
-            
-            duree_totale = m_info["duree_totale"]
-            date_debut = m_info["date_debut"]
-            date_fin = m_info["date_fin"]
-            temps_restant = date_fin - maintenant
-            temps_ecoule = maintenant - date_debut
+            try:
+                if m_info.get("en_attente", False): continue
 
-            if maintenant > date_fin:
-                missions_a_retirer.append(joueur_id)
-                profils = charger_profils(guild_id)
-                initialiser_profil(joueur_id, profils)
-                profils[str(joueur_id)]["total_echouees"] += 1
-                duree_secondes = (maintenant - date_debut).total_seconds()
-                ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
-                sauvegarder_profils(guild_id, profils)
+                channel = bot.get_channel(m_info["channel_id"])
+                if not channel: continue
 
-                role_instructeur = discord.utils.get(guild.roles, name="[ 🎴[Instruction] ]")
-                mention_ins = role_instructeur.mention if role_instructeur else '@[ 🎴[Instruction] ]'
-                
-                msg_echec = (
-                    f"🚨 **MISSION ÉCHOUÉE** 🚨\nLe temps imparti est écoulé ! La mission de <@{joueur_id}> a échoué.\n"
-                    f"📢 {mention_ins}, un citoyen a failli à son devoir.\n\n{TEXTE_ECHEC}"
-                )
-                await channel.send(msg_echec, view=VueFermerTicket())
-                await envoyer_double_notification(guild, msg_echec, f"🚨 <@{joueur_id}> a dépassé le temps imparti pour sa mission : *\"{m_info['texte']}\"* !", joueur_id=joueur_id)
-                await envoyer_log_proprietaire(bot, f"LOG ABSOLU - TEMPS ECOULE : Mission échouée par dépassement pour {joueur_id} sur {guild.name}")
-                
-            elif temps_restant <= (duree_totale / 4) and not m_info["alerte_un_quart"]:
-                m_info["alerte_un_quart"] = True
-                m_info["alerte_moitie"] = True
-                jours = temps_restant.days
-                heures, reste = divmod(temps_restant.seconds, 3600)
-                minutes, secondes = divmod(reste, 60)
-                await channel.send(f"⏳ **CRITIQUE** <@{joueur_id}> : -25% du temps restant ! Reste : `{jours}j {heures}h {minutes}mn {secondes}s` !")
-                await envoyer_log_proprietaire(bot, f"LOG ABSOLU - ALERTE 25% : Temps critique pour le joueur {joueur_id} sur {guild.name}")
-            elif temps_ecoule >= (duree_totale / 2) and not m_info["alerte_moitie"]:
-                m_info["alerte_moitie"] = True
-                await channel.send(f"🌑 **MI-PARCOURS** <@{joueur_id}> : la moitié du temps s'est écoulée !")
+                duree_totale = m_info["duree_totale"]
+                date_debut = m_info["date_debut"]
+                date_fin = m_info["date_fin"]
+                temps_restant = date_fin - maintenant
+                temps_ecoule = maintenant - date_debut
 
-        for joueur_id in missions_a_retirer:
-            if joueur_id in missions_actives[guild_id]: 
-                del missions_actives[guild_id][joueur_id]
+                if maintenant > date_fin:
+                    print(f"[VERIFIER_TEMPS_MISSIONS] Expiration détectée : guild={guild_id} joueur={joueur_id} "
+                          f"date_fin={date_fin.isoformat()} maintenant={maintenant.isoformat()} "
+                          f"duree_totale={duree_totale} texte={m_info.get('texte')!r}")
+                    missions_a_retirer.append(joueur_id)
+                    profils = charger_profils(guild_id)
+                    initialiser_profil(joueur_id, profils)
+                    profils[str(joueur_id)]["total_echouees"] += 1
+                    duree_secondes = (maintenant - date_debut).total_seconds()
+                    ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
+                    # Mission échouée par dépassement du délai : à refaire.
+                    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"]}
+                    sauvegarder_profils(guild_id, profils)
+
+                    role_instructeur = discord.utils.get(guild.roles, name="[ 🎴[Instruction] ]")
+                    mention_ins = role_instructeur.mention if role_instructeur else '@[ 🎴[Instruction] ]'
+
+                    msg_echec = (
+                        f"🚨 **MISSION ÉCHOUÉE** 🚨\nLe temps imparti est écoulé ! La mission de <@{joueur_id}> a échoué.\n"
+                        f"📢 {mention_ins}, un citoyen a failli à son devoir.\n\n{TEXTE_ECHEC}"
+                    )
+                    await channel.send(msg_echec, view=VueFermerTicket())
+                    await envoyer_double_notification(guild, msg_echec, f"🚨 <@{joueur_id}> a dépassé le temps imparti pour sa mission : *\"{m_info['texte']}\"* !", joueur_id=joueur_id)
+                    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - TEMPS ECOULE : Mission échouée par dépassement pour {joueur_id} sur {guild.name}")
+
+                elif temps_restant <= (duree_totale / 4) and not m_info["alerte_un_quart"]:
+                    m_info["alerte_un_quart"] = True
+                    m_info["alerte_moitie"] = True
+                    jours = temps_restant.days
+                    heures, reste = divmod(temps_restant.seconds, 3600)
+                    minutes, secondes = divmod(reste, 60)
+                    await channel.send(f"⏳ **CRITIQUE** <@{joueur_id}> : -25% du temps restant ! Reste : `{jours}j {heures}h {minutes}mn {secondes}s` !")
+                    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - ALERTE 25% : Temps critique pour le joueur {joueur_id} sur {guild.name}")
+                elif temps_ecoule >= (duree_totale / 2) and not m_info["alerte_moitie"]:
+                    m_info["alerte_moitie"] = True
+                    await channel.send(f"🌑 **MI-PARCOURS** <@{joueur_id}> : la moitié du temps s'est écoulée !")
+            except Exception as e:
+                # Une erreur sur UNE mission ne doit jamais interrompre la
+                # boucle pour les autres missions/serveurs, et ne doit
+                # surtout jamais provoquer de suppression silencieuse.
+                print(f"[VERIFIER_TEMPS_MISSIONS] ERREUR sur guild={guild_id} joueur={joueur_id} : {e}")
+                continue
+
+        if missions_a_retirer:
+            with verrou_missions:
+                for joueur_id in missions_a_retirer:
+                    if guild_id in missions_actives and joueur_id in missions_actives[guild_id]:
+                        del missions_actives[guild_id][joueur_id]
+
+@verifier_temps_missions.error
+async def verifier_temps_missions_erreur(erreur):
+    # Par défaut, une exception non gérée arrête définitivement une
+    # tasks.loop sans que ça se voie côté site web (les missions restent
+    # simplement "figées" en mémoire). On journalise et on redémarre.
+    print(f"[VERIFIER_TEMPS_MISSIONS] La boucle a planté et va être redémarrée : {erreur}")
+    if not verifier_temps_missions.is_running():
+        verifier_temps_missions.start()
 
 class VueBoutonTicket(VueVerrouillable):
     def __init__(self):
@@ -891,12 +954,22 @@ class VueChoixDifficulte(VueVerrouillable):
             await interaction.response.send_message("Vous avez déjà une mission active sur ce serveur !", ephemeral=True)
             return
 
-        missions_dispo = charger_missions_fichier(guild_id)
-        if not missions_dispo[cat]:
-            await interaction.response.send_message(f"❌ Plus de mission disponible dans la catégorie `{cat.upper()}` sur ce serveur.", ephemeral=True)
-            return
+        # Si ce joueur a une mission échouée/abandonnée en attente, il doit
+        # d'abord la refaire : on la lui redonne telle quelle, peu importe
+        # le bouton de catégorie cliqué, au lieu d'un tirage aléatoire.
+        mission_a_refaire = obtenir_mission_a_refaire(guild_id, self.joueur_id)
+        rappel_mission = False
+        if mission_a_refaire:
+            mission_choisie = {"texte": mission_a_refaire["texte"], "delai": mission_a_refaire.get("delai", "")}
+            cat = mission_a_refaire.get("cat", cat)
+            rappel_mission = True
+        else:
+            missions_dispo = charger_missions_fichier(guild_id)
+            if not missions_dispo[cat]:
+                await interaction.response.send_message(f"❌ Plus de mission disponible dans la catégorie `{cat.upper()}` sur ce serveur.", ephemeral=True)
+                return
+            mission_choisie = choisir_mission_sans_repetition(guild_id, self.joueur_id, missions_dispo[cat])
 
-        mission_choisie = choisir_mission_sans_repetition(guild_id, self.joueur_id, missions_dispo[cat])
         duree = extraire_duree(mission_choisie["delai"])
         date_fin = datetime.now() + duree
         timestamp_discord = int(date_fin.timestamp())
@@ -911,7 +984,10 @@ class VueChoixDifficulte(VueVerrouillable):
             child.disabled = True
 
         emoji_cat = {"commune": "🟢", "moyenne": "🔵", "difficile": "🟠", "royal": "🔴"}.get(cat, "📜")
-        embed_mission = discord.Embed(title="📜 DECRET ATTRIBUÉ ET CHRONO LANCÉ", color=discord.Color.gold())
+        titre_embed = "🔁 MISSION PRÉCÉDENTE À TERMINER" if rappel_mission else "📜 DECRET ATTRIBUÉ ET CHRONO LANCÉ"
+        embed_mission = discord.Embed(title=titre_embed, color=discord.Color.gold())
+        if rappel_mission:
+            embed_mission.description = "⚠️ Ta mission précédente a échoué ou a été abandonnée. Tu dois la refaire avant de pouvoir en obtenir une nouvelle."
         embed_mission.add_field(name="🎯 Objectif", value=f"*{mission_choisie['texte']}*", inline=False)
         embed_mission.add_field(name="🏷️ Catégorie", value=f"{emoji_cat} {cat.capitalize()}", inline=True)
         embed_mission.add_field(name="⏳ Temps restant réel", value=f"<t:{timestamp_discord}:R> (soit le <t:{timestamp_discord}:f>)", inline=False)
@@ -1865,13 +1941,15 @@ def restaurer_donnees_backup(donnees, channel_fallback=None):
             f.write(f_contenu)
 
     global missions_actives
-    missions_actives.clear()
+    with verrou_missions:
+        missions_actives.clear()
 
     m_actives_sauvegardees = donnees.get("missions_actives", {})
     nb_restaurees = 0
     for str_g_id, j_dict in m_actives_sauvegardees.items():
         g_id = int(str_g_id)
-        missions_actives[g_id] = {}
+        with verrou_missions:
+            missions_actives[g_id] = {}
         guild_obj = bot.get_guild(g_id)
 
         for str_j_id, m_data in j_dict.items():
@@ -2307,6 +2385,7 @@ site_web.configurer_site(app, bot, {
     "initialiser_profil": initialiser_profil,
     "ajouter_historique": ajouter_historique,
     "missions_actives": missions_actives,
+    "verrou_missions": verrou_missions,
     "generer_backup_complet": generer_backup_complet,
     "restaurer_donnees_backup": restaurer_donnees_backup,
     "charger_logs_recents": charger_logs_recents,
@@ -2319,6 +2398,10 @@ site_web.configurer_site(app, bot, {
     "definir_maintenance": definir_maintenance,
     "salon_annonce_maintenance_id": SALON_ANNONCE_MAINTENANCE_ID,
     "extraire_duree": extraire_duree,
+    "action_accepter_mission": action_accepter_mission,
+    "action_refuser_mission": action_refuser_mission,
+    "envoyer_double_notification": envoyer_double_notification,
+    "formater_duree": formater_duree,
 })
 
 keep_alive()
