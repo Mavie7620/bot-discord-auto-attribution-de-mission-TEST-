@@ -500,10 +500,22 @@ def _lister_guildes_avec_fichier(prefixe, suffixe=".json"):
         pass
     return ids
 
+def _resoudre_guild_osiris(guild):
+    """Le système disciplinaire doit toujours agir en tant qu'Osiris, y
+    compris quand ces fonctions sont appelées depuis le site web (qui ne
+    connaît la guilde que via le cache de Valerius). On re-résout donc la
+    guilde via bot_osiris avant tout envoi de MP ou de message de salon."""
+    if guild is None:
+        return None
+    return bot_osiris.get_guild(guild.id) or guild
+
 async def envoyer_notification_blame(guild, blame, nb_actifs):
     """Envoie un MP au joueur concerné avec le détail complet du blâme qu'il
     vient de recevoir (motif, auteur, date, nombre de blâmes actifs et date
     d'expiration automatique). Retourne True si le MP a pu être envoyé."""
+    guild = _resoudre_guild_osiris(guild)
+    if guild is None:
+        return False
     joueur_id = blame.get("joueur_id")
     membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
     if not membre:
@@ -562,6 +574,9 @@ class VueAvertirJoueur(VueVerrouillable):
 async def envoyer_avertissement(guild, joueur_id, auteur=None):
     """Envoie un avertissement (embed) en MP au joueur + log dans le salon
     du Palais Royal. Retourne True si au moins une notification est partie."""
+    guild = _resoudre_guild_osiris(guild)
+    if guild is None:
+        return False
     envoye = False
     nb_actifs = len(obtenir_blames_actifs(guild.id, joueur_id))
     embed = discord.Embed(
@@ -597,6 +612,9 @@ async def envoyer_avertissement(guild, joueur_id, auteur=None):
 
 async def declencher_proces(guild, joueur_id, blames_actifs):
     """Ouvre un procès : notifie et ping le Palais Royal dans son salon dédié."""
+    guild = _resoudre_guild_osiris(guild)
+    if guild is None:
+        return
     role_palais = discord.utils.get(guild.roles, name="[ Palais Royal ]") or discord.utils.get(guild.roles, name="Palais Royal")
     salon_cible = guild.get_channel(SALON_PALAIS_ROYAL_ID)
     mention_role = role_palais.mention if role_palais else "@Palais Royal"
