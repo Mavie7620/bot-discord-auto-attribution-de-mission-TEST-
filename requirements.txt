@@ -1,4 +1,4 @@
 discord.py
 flask
 requests
-anthropic
+groq
