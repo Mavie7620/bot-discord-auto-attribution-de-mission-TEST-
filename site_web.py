@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Site web d'administration de Valerius.
+Site web d'administration : portail unique pour Valerius (missions) et
+Osiris (blâmes/discipline). Un même compte donne accès aux deux zones.
 Tourne dans le MÊME processus Flask que le "keep_alive" du bot (bot.py) :
 même serveur Render, un seul déploiement.
 
@@ -585,7 +586,8 @@ def page_html(titre, corps, connecte=None, role=None):
         niveau = niveau_role(role)
         liens = []
         if niveau >= niveau_role("instructeur"):
-            liens.append('<a href="/admin/serveurs">Serveurs</a>')
+            liens.append('<a href="/admin/serveurs">⚖️ Valerius</a>')
+            liens.append('<a href="/admin/serveurs-osiris">🏺 Osiris</a>')
             liens.append('<a href="/admin/comptes">Comptes</a>')
         if niveau >= niveau_role("proprietaire"):
             liens.append('<a href="/admin/dashboard">Tableau de bord</a>')
@@ -606,7 +608,7 @@ def page_html(titre, corps, connecte=None, role=None):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{titre} — Valerius</title>
+<title>{titre} — Madagascar</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -615,7 +617,7 @@ def page_html(titre, corps, connecte=None, role=None):
 </head>
 <body>
 <div id="grille-curseur"></div>
-<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/drapeau.png" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">⚖️ VALERIUS</span>{nav_liens}</nav>
+<nav><a href="/" class="retour-pays" title="Retour au portail Madagascar"><img class="drapeau-nav" src="/drapeau.png" alt="Drapeau"> Madagascar</a><span class="separateur-nav">›</span><span class="brand">🛡️ ADMINISTRATION</span>{nav_liens}</nav>
 <main>
 {corps}
 </main>
@@ -776,8 +778,22 @@ def _carte_zone_html(zone):
 
 def page_accueil_pays(connecte=None, role=None):
     """Portail du pays : réservé aux comptes connectés (voir @login_required
-    sur la route "/"). Affiche les zones auxquelles le compte peut accéder."""
+    sur la route "/"). Affiche les zones auxquelles le compte peut accéder,
+    ainsi qu'un accès direct à la gestion des comptes du site (un compte
+    unique donne accès à toutes les zones, donc sa gestion n'est plus
+    rattachée à une zone en particulier mais posée ici, à la racine)."""
     cartes = "".join(_carte_zone_html(z) for z in ZONES_PAYS)
+    niveau = niveau_role(role)
+    admin_html = ""
+    if niveau >= niveau_role("instructeur"):
+        liens_admin = ['<a class="btnlink" href="/admin/comptes">👤 Gérer les comptes</a>']
+        if niveau >= niveau_role("proprietaire"):
+            liens_admin.append('<a class="btnlink" href="/admin/dashboard">📊 Tableau de bord</a>')
+            liens_admin.append('<a class="btnlink" href="/admin/securite">🔒 Sécurité</a>')
+        admin_html = f"""
+  <div class="card row" style="justify-content:center;gap:12px;margin-top:36px;max-width:900px;">
+    {''.join(liens_admin)}
+  </div>"""
     nav_html = ""
     if connecte:
         badge_icone = "👑 " if role == "proprietaire" else ""
@@ -810,7 +826,7 @@ def page_accueil_pays(connecte=None, role=None):
   <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
   <div class="zones-grid">
     {cartes}
-  </div>
+  </div>{admin_html}
   <div class="pays-pied">🇲🇬 Madagascar — connecté en tant que {connecte or ''}</div>
 </div>
 </body>
@@ -928,13 +944,13 @@ def configurer_site(app, bot, deps):
     @app.route("/osiris")
     @login_required
     def osiris_entree():
-        """Entrée dans la zone Osiris (système disciplinaire) : même logique
-        que /valerius. Un instructeur/proprietaire retombe sur la liste des
-        serveurs (où le bouton ⚖️ Blâmes est déjà disponible) ; un compte
-        de base voit son propre casier."""
+        """Entrée dans la zone Osiris (système disciplinaire) : sa propre
+        section, séparée de Valerius. Un instructeur/proprietaire arrive sur
+        la liste des serveurs côté Osiris (uniquement les blâmes) ; un
+        compte de base voit son propre casier."""
         compte = compte_connecte()
         if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
-            return redirect(url_for("admin_serveurs"))
+            return redirect(url_for("admin_serveurs_osiris"))
         return redirect(url_for("mon_casier"))
 
     @app.route("/inscription", methods=["GET", "POST"])
@@ -1172,7 +1188,7 @@ def configurer_site(app, bot, deps):
         else:
             guilds = [g for g in bot.guilds if str(g.id) == str(compte.get("guild_id"))]
         corps = render_template_string("""
-        <h1>Serveurs</h1>
+        <h1>⚖️ Valerius — Serveurs</h1>
         <p class="muted">Sélectionne un serveur pour gérer ses missions, ses profils ou ses missions en cours.</p>
         {% if not guilds %}<div class="card">Aucun serveur accessible pour ton compte. {% if not super_admin %}Ton compte n'est assigné à aucun serveur, ou celui-ci n'est plus accessible au bot.{% endif %}</div>{% endif %}
         {% for g in guilds %}
@@ -1185,13 +1201,40 @@ def configurer_site(app, bot, deps):
             <a class="btnlink" href="/admin/missions-actives/{{ g.id }}">Missions en cours</a>
             <a class="btnlink" href="/admin/profils/{{ g.id }}">Profils</a>
             <a class="btnlink" href="/admin/statistiques/{{ g.id }}">Statistiques</a>
-            <a class="btnlink" href="/admin/blames/{{ g.id }}">⚖️ Blâmes</a>
           </div>
         </div>
         {% endfor %}
         """, guilds=guilds, super_admin=(compte.get("role") == "proprietaire"),
              peut_editer_catalogue=(niveau_role(compte.get("role")) >= niveau_role("instructeur")))
-        return page_html("Serveurs", corps, connecte(), compte.get("role"))
+        return page_html("Valerius — Serveurs", corps, connecte(), compte.get("role"))
+
+    # ---------- Serveurs — zone Osiris (instructeur et plus) ----------
+    # Section totalement séparée de Valerius : uniquement le système
+    # disciplinaire (blâmes/avertissements/procès), aucun lien vers les
+    # missions, profils ou statistiques de Valerius.
+
+    @app.route("/admin/serveurs-osiris")
+    @role_required("instructeur")
+    def admin_serveurs_osiris():
+        compte = compte_connecte()
+        if compte.get("role") == "proprietaire":
+            guilds = list(bot.guilds)
+        else:
+            guilds = [g for g in bot.guilds if str(g.id) == str(compte.get("guild_id"))]
+        corps = render_template_string("""
+        <h1>🏺 Osiris — Serveurs</h1>
+        <p class="muted">Sélectionne un serveur pour gérer ses blâmes, avertissements et procès.</p>
+        {% if not guilds %}<div class="card">Aucun serveur accessible pour ton compte.</div>{% endif %}
+        {% for g in guilds %}
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>{{ g.name }}</strong><div class="muted">ID : {{ g.id }} — {{ g.member_count }} membres</div></div>
+          <div class="row">
+            <a class="btnlink" href="/admin/blames/{{ g.id }}">⚖️ Blâmes</a>
+          </div>
+        </div>
+        {% endfor %}
+        """, guilds=guilds, super_admin=(compte.get("role") == "proprietaire"))
+        return page_html("Osiris — Serveurs", corps, connecte(), compte.get("role"))
 
     # ---------- Statistiques des missions (instructeur et plus, scope serveur) ----------
 
