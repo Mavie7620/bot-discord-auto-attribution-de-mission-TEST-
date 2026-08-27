@@ -597,6 +597,7 @@ def page_html(titre, corps, connecte=None, role=None):
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
             liens.append('<a href="/mon-catalogue">Catalogue</a>')
+            liens.append('<a href="/mon-casier">Mon casier</a>')
         badge_icone = "👑 " if role == "proprietaire" else ""
         badge = f'<span class="badge {role}">{badge_icone}{ROLE_LABELS.get(role, role)}</span>' if role else ""
         nav_liens = "".join(liens) + f'<span class="muted">{connecte}</span>{badge}<a href="/deconnexion">Déconnexion</a>'
@@ -637,12 +638,12 @@ ZONES_PAYS = [
         "disponible": True,
     },
     {
-        "id": "zone-2",
-        "nom": "???",
-        "icone": "🔒",
-        "description": "Zone en préparation.",
-        "url": None,
-        "disponible": False,
+        "id": "osiris",
+        "nom": "Osiris",
+        "icone": "🏺",
+        "description": "Système disciplinaire : blâmes, avertissements et procès royaux.",
+        "url": "/osiris",
+        "disponible": True,
     },
     {
         "id": "zone-3",
@@ -923,6 +924,18 @@ def configurer_site(app, bot, deps):
         if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
             return redirect(url_for("admin_serveurs"))
         return redirect(url_for("mon_profil"))
+
+    @app.route("/osiris")
+    @login_required
+    def osiris_entree():
+        """Entrée dans la zone Osiris (système disciplinaire) : même logique
+        que /valerius. Un instructeur/proprietaire retombe sur la liste des
+        serveurs (où le bouton ⚖️ Blâmes est déjà disponible) ; un compte
+        de base voit son propre casier."""
+        compte = compte_connecte()
+        if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
+            return redirect(url_for("admin_serveurs"))
+        return redirect(url_for("mon_casier"))
 
     @app.route("/inscription", methods=["GET", "POST"])
     def inscription():
@@ -2732,6 +2745,42 @@ def configurer_site(app, bot, deps):
         </div>
         """, profil=profil, historique_connexions=historique_connexions)
         return page_html("Mon profil", corps, connecte(), compte.get("role"))
+
+    @app.route("/mon-casier")
+    @login_required
+    def mon_casier():
+        """Casier disciplinaire personnel (zone Osiris) : un compte de base
+        ('malgache') y voit uniquement ses propres blâmes actifs — en
+        lecture seule, aucune action possible depuis cette page."""
+        compte = compte_connecte()
+        if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
+            return redirect(url_for("admin_serveurs"))
+        discord_id = compte.get("discord_id")
+        guild_id = compte.get("guild_id")
+        actifs = []
+        if discord_id and guild_id:
+            actifs = deps["obtenir_blames_actifs"](int(guild_id), discord_id)
+        corps = render_template_string("""
+        <h1>⚖️ Mon casier — Osiris</h1>
+        {% if not guild_id %}
+        <div class="card">Ton compte n'est relié à aucun serveur pour l'instant. Demande à un administrateur de vérifier ton profil.</div>
+        {% elif not actifs %}
+        <div class="card">✅ Aucun blâme actif sur ton compte. Continue comme ça !</div>
+        {% else %}
+        <div class="card">
+          <strong>{{ actifs|length }}</strong> blâme(s) actif(s)
+          {% if actifs|length > seuil_proces %} — ⚠️ le seuil de procès ({{ seuil_proces }}) est dépassé{% endif %}
+        </div>
+        <table>
+          <tr><th>Date</th><th>Motif</th></tr>
+          {% for b in actifs %}
+          <tr><td>{{ b.date }}</td><td>{{ b.raison }}</td></tr>
+          {% endfor %}
+        </table>
+        <p class="muted">Chaque blâme s'efface automatiquement 2 semaines après son ajout. Un avertissement officiel est envoyé automatiquement à partir de 2 blâmes actifs.</p>
+        {% endif %}
+        """, actifs=actifs, guild_id=guild_id, seuil_proces=deps["seuil_proces_blame"])
+        return page_html("Mon casier", corps, connecte(), compte.get("role"))
 
     @app.route("/mon-catalogue")
     @login_required
