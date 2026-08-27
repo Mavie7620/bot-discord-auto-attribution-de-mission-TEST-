@@ -588,14 +588,7 @@ def page_html(titre, corps, connecte=None, role=None):
         if niveau >= niveau_role("instructeur"):
             liens.append('<a href="/admin/serveurs">⚖️ Valerius</a>')
             liens.append('<a href="/admin/serveurs-osiris">🏺 Osiris</a>')
-            liens.append('<a href="/admin/comptes">Comptes</a>')
-        if niveau >= niveau_role("proprietaire"):
-            liens.append('<a href="/admin/dashboard">Tableau de bord</a>')
-            liens.append('<a href="/admin/logs">Logs</a>')
-            liens.append('<a href="/admin/securite">Sécurité</a>')
-            liens.append('<a href="/admin/message">Message</a>')
-            liens.append('<a href="/admin/recherche-joueur">Rechercher un joueur</a>')
-            liens.append('<a href="/admin/backup">Sauvegardes</a>')
+            liens.append('<a href="/admin">🛡️ Administration</a>')
         if niveau < niveau_role("instructeur"):
             liens.append('<a href="/mon-profil">Mon profil</a>')
             liens.append('<a href="/mon-catalogue">Catalogue</a>')
@@ -778,22 +771,23 @@ def _carte_zone_html(zone):
 
 def page_accueil_pays(connecte=None, role=None):
     """Portail du pays : réservé aux comptes connectés (voir @login_required
-    sur la route "/"). Affiche les zones auxquelles le compte peut accéder,
-    ainsi qu'un accès direct à la gestion des comptes du site (un compte
-    unique donne accès à toutes les zones, donc sa gestion n'est plus
-    rattachée à une zone en particulier mais posée ici, à la racine)."""
-    cartes = "".join(_carte_zone_html(z) for z in ZONES_PAYS)
-    niveau = niveau_role(role)
-    admin_html = ""
-    if niveau >= niveau_role("instructeur"):
-        liens_admin = ['<a class="btnlink" href="/admin/comptes">👤 Gérer les comptes</a>']
-        if niveau >= niveau_role("proprietaire"):
-            liens_admin.append('<a class="btnlink" href="/admin/dashboard">📊 Tableau de bord</a>')
-            liens_admin.append('<a class="btnlink" href="/admin/securite">🔒 Sécurité</a>')
-        admin_html = f"""
-  <div class="card row" style="justify-content:center;gap:12px;margin-top:36px;max-width:900px;">
-    {''.join(liens_admin)}
-  </div>"""
+    sur la route "/"). Affiche les zones auxquelles le compte peut accéder.
+    Une 4e carte "Administration" apparaît uniquement pour les comptes
+    instructeur et plus : elle regroupe absolument tous les outils de
+    gestion du site (comptes, sauvegardes, sécurité, logs...), qui ne sont
+    plus dispersés ailleurs (ni dans Valerius, ni dans Osiris, ni dans la
+    nav des autres pages)."""
+    zones = list(ZONES_PAYS)
+    if niveau_role(role) >= niveau_role("instructeur"):
+        zones.insert(2, {
+            "id": "administration",
+            "nom": "Administration",
+            "icone": "🛡️",
+            "description": "Comptes du site, sauvegardes, sécurité, logs et outils réservés au staff.",
+            "url": "/admin",
+            "disponible": True,
+        })
+    cartes = "".join(_carte_zone_html(z) for z in zones)
     nav_html = ""
     if connecte:
         badge_icone = "👑 " if role == "proprietaire" else ""
@@ -826,7 +820,7 @@ def page_accueil_pays(connecte=None, role=None):
   <p class="pays-sous-titre">Choisis une zone pour y accéder. D'autres zones ouvriront prochainement.</p>
   <div class="zones-grid">
     {cartes}
-  </div>{admin_html}
+  </div>
   <div class="pays-pied">🇲🇬 Madagascar — connecté en tant que {connecte or ''}</div>
 </div>
 </body>
@@ -952,6 +946,53 @@ def configurer_site(app, bot, deps):
         if niveau_role(compte.get("role")) >= niveau_role("instructeur"):
             return redirect(url_for("admin_serveurs_osiris"))
         return redirect(url_for("mon_casier"))
+
+    @app.route("/admin")
+    @role_required("instructeur")
+    def admin_hub():
+        """Zone "Administration" : regroupe absolument TOUS les outils de
+        gestion du site qui ne sont pas propres à Valerius ou Osiris
+        (comptes, sauvegardes, sécurité, logs, message, recherche joueur).
+        Rien de ceci n'apparaît plus ailleurs dans la navigation."""
+        compte = compte_connecte()
+        super_admin = niveau_role(compte.get("role")) >= niveau_role("proprietaire")
+        corps = render_template_string("""
+        <h1>🛡️ Administration</h1>
+        <p class="muted">Tous les outils de gestion du site, indépendants des zones Valerius et Osiris.</p>
+
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>👤 Comptes</strong><div class="muted">Créer, modifier ou supprimer les comptes du site.</div></div>
+          <a class="btnlink" href="/admin/comptes">Ouvrir</a>
+        </div>
+
+        {% if super_admin %}
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>📊 Tableau de bord</strong><div class="muted">Vue d'ensemble globale du bot et du site.</div></div>
+          <a class="btnlink" href="/admin/dashboard">Ouvrir</a>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>📜 Logs</strong><div class="muted">Historique des actions globales du bot.</div></div>
+          <a class="btnlink" href="/admin/logs">Ouvrir</a>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>🔒 Sécurité</strong><div class="muted">Verrouillage des serveurs, code d'activation, maintenance.</div></div>
+          <a class="btnlink" href="/admin/securite">Ouvrir</a>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>✉️ Message</strong><div class="muted">Envoyer un message dans n'importe quel salon Discord.</div></div>
+          <a class="btnlink" href="/admin/message">Ouvrir</a>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>🔎 Rechercher un joueur</strong><div class="muted">Retrouver un joueur sur l'ensemble des serveurs.</div></div>
+          <a class="btnlink" href="/admin/recherche-joueur">Ouvrir</a>
+        </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>💾 Sauvegardes</strong><div class="muted">Exporter/restaurer toutes les données du bot (tous serveurs).</div></div>
+          <a class="btnlink" href="/admin/backup">Ouvrir</a>
+        </div>
+        {% endif %}
+        """, super_admin=super_admin)
+        return page_html("Administration", corps, connecte(), compte.get("role"))
 
     @app.route("/inscription", methods=["GET", "POST"])
     def inscription():
