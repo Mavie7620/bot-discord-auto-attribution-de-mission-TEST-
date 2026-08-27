@@ -58,12 +58,16 @@ SALON_ANNONCE_MAINTENANCE_ID = 1517995293944057867
 # Utilise l'API Groq (gratuite, https://console.groq.com) pour répondre aux
 # questions des joueurs. Anciennement propulsée par Claude (Anthropic, payant) ;
 # remplacée par Groq, qui donne accès gratuitement à des modèles open-source
-# (Llama 3.3) largement suffisants pour cet usage, avec une API très proche.
+# largement suffisants pour cet usage, avec une API très proche.
+# NOTE : "llama-3.3-70b-versatile" a été décommissionné par Groq (juin 2026).
+# Groq recommande de migrer vers "openai/gpt-oss-120b" (ou "qwen/qwen3.6-27b"),
+# d'où le nouveau modèle par défaut ci-dessous. Voir
+# https://console.groq.com/docs/deprecations pour la liste à jour.
 # Clé API à définir sur Render (ou en local) via la variable d'environnement
 # GROQ_API_KEY. Sans clé, la commande /ia (et la page du site) répondent
 # simplement que l'IA n'est pas configurée, sans faire planter le bot.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 IA_MAX_TOKENS = 1024
 
 client_ia = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None

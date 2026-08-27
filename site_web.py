@@ -593,6 +593,9 @@ def page_html(titre, corps, connecte=None, role=None):
             liens.append('<a href="/mon-profil">Mon profil</a>')
             liens.append('<a href="/mon-catalogue">Catalogue</a>')
             liens.append('<a href="/mon-casier">Mon casier</a>')
+        # Accessible à tous les comptes connectés, quel que soit leur rôle
+        # (y compris "malgache") — plus dans "Administration".
+        liens.append('<a href="/ia">🔮 IA</a>')
         badge_icone = "👑 " if role == "proprietaire" else ""
         badge = f'<span class="badge {role}">{badge_icone}{ROLE_LABELS.get(role, role)}</span>' if role else ""
         nav_liens = "".join(liens) + f'<span class="muted">{connecte}</span>{badge}<a href="/deconnexion">Déconnexion</a>'
@@ -964,11 +967,6 @@ def configurer_site(app, bot, deps):
           <div><strong>👤 Comptes</strong><div class="muted">Créer, modifier ou supprimer les comptes du site.</div></div>
           <a class="btnlink" href="/admin/comptes">Ouvrir</a>
         </div>
-        <div class="card row" style="justify-content:space-between;">
-          <div><strong>🔮 Intelligence Royale (IA)</strong><div class="muted">Poser une question à l'IA du bot directement depuis le site.</div></div>
-          <a class="btnlink" href="/admin/ia">Ouvrir</a>
-        </div>
-
         {% if super_admin %}
         <div class="card row" style="justify-content:space-between;">
           <div><strong>📊 Tableau de bord</strong><div class="muted">Vue d'ensemble globale du bot et du site.</div></div>
@@ -2484,13 +2482,15 @@ def configurer_site(app, bot, deps):
 
     # ---------- Admin : Intelligence Royale (IA, gratuite via Groq) ----------
 
-    @app.route("/admin/ia", methods=["GET", "POST"])
-    @role_required("instructeur")
+    @app.route("/ia", methods=["GET", "POST"])
+    @login_required
     def admin_ia():
         """Permet de poser une question à l'IA du bot directement depuis le
-        site, sans passer par Discord. Chaque compte connecté a sa propre
-        mémoire de conversation (clé ("site", login)), séparée de celles
-        utilisées côté Discord."""
+        site, sans passer par Discord. Accessible à TOUT compte connecté,
+        quel que soit son rôle (y compris "malgache") — ce n'est plus un
+        outil d'Administration. Chaque compte connecté a sa propre mémoire
+        de conversation (clé ("site", login)), séparée de celles utilisées
+        côté Discord."""
         compte = compte_connecte()
         cle_ia = ("site", connecte())
         reponse = None
