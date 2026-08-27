@@ -35,6 +35,15 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Second bot, dans le même processus : "Osiris" gère uniquement le système
+# disciplinaire (blâmes / avertissements / procès). Il partage tout le reste
+# du code avec Valerius (fichiers, permissions, verrou de serveur, logs) —
+# seul son token Discord et ses commandes lui sont propres.
+# ⚠️ Osiris doit être invité séparément sur chaque serveur, avec l'intent
+# "Server Members Intent" activé sur le Discord Developer Portal, tout
+# comme Valerius, pour pouvoir mettre en DM et lire les rôles des joueurs.
+bot_osiris = commands.Bot(command_prefix="?", intents=intents)
+
 BOT_START_TIME = datetime.now()
 
 PROPRIETAIRE_ID = 1109866808321769472
@@ -546,7 +555,7 @@ async def envoyer_avertissement(guild, joueur_id, auteur=None):
         except Exception:
             pass
 
-    await envoyer_log_proprietaire(bot, f"[{guild.name}] ⚠️ Avertissement envoyé à <@{joueur_id}> ({nb_actifs} blâme(s) actif(s)).")
+    await envoyer_log_proprietaire(bot_osiris, f"[{guild.name}] ⚠️ Avertissement envoyé à <@{joueur_id}> ({nb_actifs} blâme(s) actif(s)).")
     return envoye
 
 async def declencher_proces(guild, joueur_id, blames_actifs):
@@ -570,7 +579,7 @@ async def declencher_proces(guild, joueur_id, blames_actifs):
             await salon_cible.send(f"🚨 {mention_role} ! Un procès doit être ouvert contre <@{joueur_id}>.", embed=embed)
         except Exception as e:
             print(f"Erreur envoi procès: {e}")
-    await envoyer_log_proprietaire(bot, f"[{guild.name}] 🚨 PROCÈS déclenché contre <@{joueur_id}> ({len(blames_actifs)} blâmes actifs).")
+    await envoyer_log_proprietaire(bot_osiris, f"[{guild.name}] 🚨 PROCÈS déclenché contre <@{joueur_id}> ({len(blames_actifs)} blâmes actifs).")
 
 async def traiter_seuils_blame(guild, joueur_id):
     """À appeler après l'ajout d'un blâme (commande ou site web) : déclenche
@@ -1523,6 +1532,11 @@ async def verrou_interaction_check(interaction: discord.Interaction):
     return True
 
 bot.tree.interaction_check = verrou_interaction_check
+# Osiris partage exactement le même verrou de serveur que Valerius : le code
+# d'activation saisi via /deverrouiller (commande Valerius) déverrouille les
+# deux bots en même temps, car ils lisent le même fichier + la même variable
+# en mémoire (guildes_deverrouillees), le tout dans le même processus.
+bot_osiris.tree.interaction_check = verrou_interaction_check
 
 @bot.check
 async def verrou_commandes_prefixe(ctx):
@@ -1669,7 +1683,6 @@ async def liste_supermodos(interaction: discord.Interaction):
 async def on_ready():
     if not verifier_temps_missions.is_running(): verifier_temps_missions.start()
     if not sauvegarde_automatique.is_running(): sauvegarde_automatique.start()
-    if not verifier_blames_expires_periodique.is_running(): verifier_blames_expires_periodique.start()
     
     bot.add_view(VueBoutonTicket())
     bot.add_view(VueFermerTicket())
@@ -1677,7 +1690,6 @@ async def on_ready():
     bot.add_view(VueAccueilArrivant())
     bot.add_view(VueGestionJoueurMission())
     bot.add_view(VueEvaluationMission())
-    bot.add_view(VueAvertirJoueur())
 
     await site_web.initialiser_compte_proprietaire(envoyer_log_proprietaire, bot)
 
@@ -1709,6 +1721,21 @@ async def on_ready():
         print(f"Bot Valerius Pro — {len(synced)} Commandes Slash synchronisées !")
     except Exception as e:
         print(f"Erreur de synchronisation slash: {e}")
+
+@bot_osiris.event
+async def on_ready():
+    if not verifier_blames_expires_periodique.is_running():
+        verifier_blames_expires_periodique.start()
+
+    bot_osiris.add_view(VueAvertirJoueur())
+
+    try:
+        synced = await bot_osiris.tree.sync()
+        print(f"Bot Osiris — {len(synced)} commande(s) slash synchronisée(s) !")
+    except Exception as e:
+        print(f"Erreur de synchronisation slash (Osiris): {e}")
+
+    await envoyer_log_proprietaire(bot_osiris, "⚖️ **Bot Osiris démarré avec succès !** Système disciplinaire opérationnel.")
 
 @bot.event
 async def on_message(message):
@@ -2437,8 +2464,8 @@ async def tutoadm(interaction: discord.Interaction):
         inline=False
     )
     embed_tuto.add_field(
-        name="⚖️ 3. Décrets & Discipline (Osiris)",
-        value="`/rankup @joueur @nouveau_rang` -> Publie le Décret Royal de promotion (retire aussi l'ancien rôle si précisé)\n`/blam @joueur [raison]` -> Inflige un blâme (expire seul après 2 semaines ; avertissement auto à 2, procès au-delà de 7)\n`/blames @joueur` -> Liste ses blâmes actifs\n`/retirerblam @joueur [numero]` -> Retire un blâme précis (gérable aussi depuis le site web)",
+        name="⚖️ 3. Décrets & Discipline",
+        value="`/rankup @joueur @nouveau_rang` -> Publie le Décret Royal de promotion (retire aussi l'ancien rôle si précisé)\n\n**Sur le bot Osiris (⚖️) :**\n`/blam @joueur [raison]` -> Inflige un blâme (expire seul après 2 semaines ; avertissement auto à 2, procès au-delà de 7)\n`/blames @joueur` -> Liste ses blâmes actifs\n`/retirerblam @joueur [numero]` -> Retire un blâme précis (gérable aussi depuis le site web)",
         inline=False
     )
     embed_tuto.add_field(
@@ -2621,7 +2648,7 @@ async def rankup(interaction: discord.Interaction, joueur: discord.Member, nouve
     else:
         await interaction.followup.send(f"✅ Décret Royal publié dans {salon_cible.mention} !", ephemeral=True)
 
-@bot.tree.command(name="blam", description="Inflige un blâme à un joueur (expire automatiquement après 2 semaines).")
+@bot_osiris.tree.command(name="blam", description="Inflige un blâme à un joueur (expire automatiquement après 2 semaines).")
 @app_commands.describe(joueur="Le citoyen concerné", raison="Motif du blâme")
 async def blam(interaction: discord.Interaction, joueur: discord.Member, raison: str):
     if not verifier_permissions_staff(interaction.user):
@@ -2641,11 +2668,11 @@ async def blam(interaction: discord.Interaction, joueur: discord.Member, raison:
     embed.set_footer(text=f"Infligé par {interaction.user.display_name} • Expire dans 2 semaines")
 
     await interaction.followup.send(embed=embed, view=VueAvertirJoueur(joueur.id))
-    await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] ⚖️ Blâme infligé à {joueur} par {interaction.user} : {raison} ({nb} actif(s)).")
+    await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] ⚖️ Blâme infligé à {joueur} par {interaction.user} : {raison} ({nb} actif(s)).")
 
     await traiter_seuils_blame(interaction.guild, joueur.id)
 
-@bot.tree.command(name="blames", description="Affiche les blâmes actifs d'un joueur.")
+@bot_osiris.tree.command(name="blames", description="Affiche les blâmes actifs d'un joueur.")
 @app_commands.describe(joueur="Le citoyen concerné")
 async def blames(interaction: discord.Interaction, joueur: discord.Member):
     if not verifier_permissions_staff(interaction.user):
@@ -2661,7 +2688,7 @@ async def blames(interaction: discord.Interaction, joueur: discord.Member):
     embed.set_footer(text=f"{len(actifs)} blâme(s) actif(s) • Un blâme expire 2 semaines après son ajout • Procès au-delà de {SEUIL_PROCES_BLAME}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="retirerblam", description="Retire un blâme précis d'un joueur (numéro visible via /blames).")
+@bot_osiris.tree.command(name="retirerblam", description="Retire un blâme précis d'un joueur (numéro visible via /blames).")
 @app_commands.describe(joueur="Le citoyen concerné", numero="Le numéro du blâme à retirer (voir /blames)")
 async def retirerblam(interaction: discord.Interaction, joueur: discord.Member, numero: int):
     if not verifier_permissions_staff(interaction.user):
@@ -2670,7 +2697,7 @@ async def retirerblam(interaction: discord.Interaction, joueur: discord.Member, 
     retire = retirer_blame_par_index(interaction.guild.id, joueur.id, numero - 1)
     if retire:
         await interaction.response.send_message(f"🗑️ Blâme n°{numero} retiré à {joueur.mention}.", ephemeral=True)
-        await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] 🗑️ Blâme retiré à {joueur} par {interaction.user} (raison retirée : {retire['raison']}).")
+        await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] 🗑️ Blâme retiré à {joueur} par {interaction.user} (raison retirée : {retire['raison']}).")
     else:
         await interaction.response.send_message("❌ Blâme introuvable pour ce joueur (vérifie le numéro avec /blames).", ephemeral=True)
 
@@ -2711,8 +2738,29 @@ site_web.configurer_site(app, bot, {
 })
 
 keep_alive()
-token = os.environ.get("DIS_TOKEN") or os.environ.get("DISCORD_TOKEN")
-if token:
-    bot.run(token)
-else:
-    print("Erreur : Aucun token Discord trouvé.")
+
+async def main():
+    token_valerius = os.environ.get("DIS_TOKEN") or os.environ.get("DISCORD_TOKEN")
+    # Variable Render existante côté utilisateur : "osiris_id"
+    token_osiris = os.environ.get("osiris_id") or os.environ.get("OSIRIS_TOKEN") or os.environ.get("OSIRIS_ID")
+
+    if not token_valerius:
+        print("Erreur : Aucun token Discord trouvé pour Valerius (DIS_TOKEN / DISCORD_TOKEN).")
+        return
+
+    if not token_osiris:
+        print("⚠️ Aucun token trouvé pour Osiris (variable 'osiris_id') — seul Valerius va démarrer.")
+        async with bot:
+            await bot.start(token_valerius)
+        return
+
+    async with bot, bot_osiris:
+        await asyncio.gather(
+            bot.start(token_valerius),
+            bot_osiris.start(token_osiris),
+        )
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    pass
