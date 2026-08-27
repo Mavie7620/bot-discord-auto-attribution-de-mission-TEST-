@@ -500,6 +500,43 @@ def _lister_guildes_avec_fichier(prefixe, suffixe=".json"):
         pass
     return ids
 
+async def envoyer_notification_blame(guild, blame, nb_actifs):
+    """Envoie un MP au joueur concerné avec le détail complet du blâme qu'il
+    vient de recevoir (motif, auteur, date, nombre de blâmes actifs et date
+    d'expiration automatique). Retourne True si le MP a pu être envoyé."""
+    joueur_id = blame.get("joueur_id")
+    membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
+    if not membre:
+        return False
+
+    auteur_id = blame.get("auteur_id")
+    auteur_membre = guild.get_member(int(auteur_id)) if str(auteur_id).isdigit() else None
+    nom_auteur = auteur_membre.display_name if auteur_membre else "le Palais Royal (via le site web)"
+
+    try:
+        date_ajout = datetime.strptime(blame.get("date", ""), "%d/%m/%Y à %H:%M")
+        date_expiration = (date_ajout + DUREE_EXPIRATION_BLAME).strftime("%d/%m/%Y à %H:%M")
+    except (ValueError, TypeError):
+        date_expiration = "dans 2 semaines"
+
+    embed = discord.Embed(
+        title="⚖️ Vous avez reçu un blâme — Osiris",
+        description=f"Un blâme vient de vous être infligé sur **{guild.name}**.",
+        color=discord.Color.dark_gold()
+    )
+    embed.add_field(name="Motif", value=blame.get("raison", "Non précisé"), inline=False)
+    embed.add_field(name="Infligé par", value=nom_auteur, inline=True)
+    embed.add_field(name="Date", value=blame.get("date", "inconnue"), inline=True)
+    embed.add_field(name="Blâmes actifs", value=f"**{nb_actifs}** — un procès s'ouvre au-delà de {SEUIL_PROCES_BLAME}", inline=False)
+    embed.add_field(name="Expiration automatique", value=date_expiration, inline=False)
+    embed.set_footer(text=f"{guild.name} • Système disciplinaire Osiris")
+
+    try:
+        await membre.send(embed=embed)
+        return True
+    except Exception:
+        return False
+
 class VueAvertirJoueur(VueVerrouillable):
     """Bouton permettant au staff d'envoyer un avertissement officiel à
     tout moment, indépendamment du seuil automatique de 2 blâmes."""
@@ -2656,7 +2693,8 @@ async def blam(interaction: discord.Interaction, joueur: discord.Member, raison:
         return
     await interaction.response.defer()
 
-    _, nb = ajouter_blame(interaction.guild.id, joueur.id, raison, interaction.user.id)
+    nouveau, nb = ajouter_blame(interaction.guild.id, joueur.id, raison, interaction.user.id)
+    mp_envoye = await envoyer_notification_blame(interaction.guild, nouveau, nb)
 
     embed = discord.Embed(
         title="⚖️ Blâme infligé — Osiris",
@@ -2665,6 +2703,7 @@ async def blam(interaction: discord.Interaction, joueur: discord.Member, raison:
     )
     embed.add_field(name="Motif", value=raison, inline=False)
     embed.add_field(name="Blâmes actifs", value=f"**{nb}** — un procès s'ouvre au-delà de {SEUIL_PROCES_BLAME}", inline=False)
+    embed.add_field(name="MP au joueur", value="✅ Envoyé" if mp_envoye else "⚠️ Impossible (MP fermés ou joueur introuvable)", inline=False)
     embed.set_footer(text=f"Infligé par {interaction.user.display_name} • Expire dans 2 semaines")
 
     await interaction.followup.send(embed=embed, view=VueAvertirJoueur(joueur.id))
@@ -2734,6 +2773,7 @@ site_web.configurer_site(app, bot, {
     "ajouter_blame": ajouter_blame,
     "retirer_blame_par_index": retirer_blame_par_index,
     "traiter_seuils_blame": traiter_seuils_blame,
+    "envoyer_notification_blame": envoyer_notification_blame,
     "seuil_proces_blame": SEUIL_PROCES_BLAME,
 })
 

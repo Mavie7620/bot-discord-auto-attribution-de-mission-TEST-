@@ -1928,9 +1928,10 @@ def configurer_site(app, bot, deps):
             if not joueur_id.isdigit() or not raison:
                 erreur = "Indique un ID Discord de joueur valide et un motif."
             else:
-                deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
+                nouveau, nb = deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
                 deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
                 if g:
+                    _executer_async_blame(deps["envoyer_notification_blame"](g, nouveau, nb))
                     _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
                 message = "Blâme ajouté."
 
@@ -1992,9 +1993,10 @@ def configurer_site(app, bot, deps):
                 if not raison:
                     erreur = "Décris le motif du blâme."
                 else:
-                    deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
+                    nouveau, nb = deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
                     deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
                     if g:
+                        _executer_async_blame(deps["envoyer_notification_blame"](g, nouveau, nb))
                         _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
                     message = "Blâme ajouté."
             elif action == "retirer":
