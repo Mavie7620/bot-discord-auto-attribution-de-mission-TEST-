@@ -81,6 +81,74 @@ VALERIUS_IA_SYSTEM_PROMPT = (
     "réponses interminables sauf si on te le demande explicitement)."
 )
 
+# Contexte général du "pays" / royaume, pour que l'IA sache toujours répondre
+# correctement même sans qu'on le lui reformule à chaque fois. Volontairement
+# SANS aucune information sensible (pas d'ID Discord, pas de code de
+# déverrouillage, pas de token) : uniquement des règles publiques du jeu de
+# rôle, connues de tous les joueurs.
+CONTEXTE_ROYAUME = (
+    "Contexte du Royaume (à connaître pour bien répondre) :\n"
+    "- Le site/bot gère deux systèmes distincts : « Valerius » (missions) et "
+    "« Osiris » (discipline : blâmes, avertissements, rankups/deranks).\n"
+    "- Missions Valerius : 4 catégories de difficulté croissante — "
+    "🟢 Commune (délai ~3 jours), 🔵 Moyenne (~7 jours), 🟠 Difficile (~15 jours), "
+    "🔴 Royal (~20 jours). Un joueur ouvre un ticket, choisit une difficulté, "
+    "reçoit une mission aléatoire de cette catégorie avec un chrono, puis doit "
+    "la valider (bouton « Finir la mission » ou /missionaccomplie) avant "
+    "l'expiration, sous peine d'échec automatique.\n"
+    "- Une fois la mission déclarée finie, un instructeur évalue : Accepter, "
+    "Refuser, ou Demander une preuve (capture d'écran).\n"
+    "- Rôles sur le site web, du plus faible au plus élevé : « Malgache » "
+    "(compte de base, accès à son profil/catalogue/casier), « Instructeur » "
+    "(gère les serveurs, missions, comptes), « Propriétaire » (accès total).\n"
+    "- Système Osiris : les blâmes expirent automatiquement après 2 semaines."
+)
+
+
+def _generer_catalogue_commandes():
+    """Construit dynamiquement la liste des commandes slash déclarées sur
+    les deux bots (Valerius et Osiris), à partir de ce qui est réellement
+    enregistré dans le code (bot.tree / bot_osiris.tree). Comme c'est généré
+    à l'exécution, la liste reste toujours synchronisée avec le code, même
+    si des commandes sont ajoutées/retirées plus tard — pas besoin de la
+    maintenir à la main."""
+    lignes = []
+    for label, arbre in (("Valerius", bot.tree), ("Osiris", bot_osiris.tree)):
+        commandes = sorted(arbre.get_commands(), key=lambda c: c.name)
+        if not commandes:
+            continue
+        lignes.append(f"[{label}]")
+        for cmd in commandes:
+            desc = (cmd.description or "").strip()
+            lignes.append(f"/{cmd.name} — {desc}" if desc else f"/{cmd.name}")
+    return "\n".join(lignes)
+
+
+# Mis en cache au premier appel : à ce moment-là, tous les décorateurs
+# @bot.tree.command du fichier ont déjà été exécutés (le module est
+# entièrement chargé avant que le bot ne tourne et ne réponde à une
+# question), donc le catalogue est complet dès la première question posée.
+_catalogue_commandes_cache = None
+
+def obtenir_prompt_systeme_ia():
+    """Assemble le prompt système complet envoyé à l'IA : personnalité +
+    contexte du royaume + catalogue des commandes du bot. Permet à l'IA de
+    répondre correctement si un joueur lui demande « comment fonctionne telle "
+    "commande » ou « à quoi sert /xxx »."""
+    global _catalogue_commandes_cache
+    if _catalogue_commandes_cache is None:
+        _catalogue_commandes_cache = _generer_catalogue_commandes()
+    parties = [VALERIUS_IA_SYSTEM_PROMPT, CONTEXTE_ROYAUME]
+    if _catalogue_commandes_cache:
+        parties.append(
+            "Liste des commandes disponibles sur le bot (nom — description) :\n"
+            + _catalogue_commandes_cache
+            + "\n\nSi on te demande comment utiliser une commande, explique-la "
+            "clairement à partir de cette liste. Si une commande n'y figure "
+            "pas, dis que tu ne la reconnais pas plutôt que d'inventer."
+        )
+    return "\n\n".join(parties)
+
 # Mémoire de conversation en RAM (non persistée entre redémarrages), pour que
 # l'IA garde le contexte des derniers échanges d'un joueur sur un salon donné.
 IA_HISTORIQUE_MAX_MESSAGES = 10  # nombre de messages (user+assistant) conservés
@@ -106,7 +174,7 @@ async def interroger_ia(cle, question: str):
     if not client_ia:
         return None, "❌ L'Intelligence Royale n'est pas configurée : aucune clé API Groq (variable `GROQ_API_KEY`) n'a été définie."
     historique = _ia_historique.get(cle, [])
-    messages = [{"role": "system", "content": VALERIUS_IA_SYSTEM_PROMPT}] + historique + [{"role": "user", "content": question}]
+    messages = [{"role": "system", "content": obtenir_prompt_systeme_ia()}] + historique + [{"role": "user", "content": question}]
     try:
         reponse = await client_ia.chat.completions.create(
             model=GROQ_MODEL,
