@@ -2534,7 +2534,7 @@ def configurer_site(app, bot, deps):
           </form>
           <form method="post" style="margin-top:10px;">
             <input type="hidden" name="reset" value="1">
-            <button type="submit" style="background:transparent;border:1px solid var(--border);">🧹 Réinitialiser la mémoire</button>
+            <button type="submit" class="secondary">🧹 Réinitialiser la mémoire</button>
           </form>
         </div>
         """, reponse=reponse, erreur=erreur)
