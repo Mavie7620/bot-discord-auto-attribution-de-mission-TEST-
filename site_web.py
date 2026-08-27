@@ -1172,6 +1172,7 @@ def configurer_site(app, bot, deps):
             <a class="btnlink" href="/admin/missions-actives/{{ g.id }}">Missions en cours</a>
             <a class="btnlink" href="/admin/profils/{{ g.id }}">Profils</a>
             <a class="btnlink" href="/admin/statistiques/{{ g.id }}">Statistiques</a>
+            <a class="btnlink" href="/admin/blames/{{ g.id }}">⚖️ Blâmes</a>
           </div>
         </div>
         {% endfor %}
@@ -1802,6 +1803,158 @@ def configurer_site(app, bot, deps):
         </table>
         """, profil=profil, joueur_id=joueur_id, guild_id=guild_id, peut_modifier=peut_modifier, message=message, erreur=erreur, pseudo_joueur=pseudo_joueur)
         return page_html("Historique", corps, connecte(), compte.get("role"))
+
+    # ---------- Admin : blâmes (Osiris) — instructeur et plus, scope serveur ----------
+
+    def _executer_async_blame(coro):
+        """Exécute une coroutine du bot (envoi d'avertissement/procès Discord)
+        depuis une route Flask synchrone, sur la boucle asyncio du bot."""
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+            future.result(timeout=10)
+        except Exception as e:
+            print(f"[BLÂMES SITE] Erreur exécution async : {e}")
+
+    @app.route("/admin/blames/<int:guild_id>", methods=["GET", "POST"])
+    @role_required("instructeur")
+    def admin_blames(guild_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        message = None
+        erreur = None
+
+        if request.method == "POST":
+            joueur_id = request.form.get("joueur_id", "").strip()
+            raison = request.form.get("raison", "").strip()
+            if not joueur_id.isdigit() or not raison:
+                erreur = "Indique un ID Discord de joueur valide et un motif."
+            else:
+                deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
+                deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
+                if g:
+                    _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
+                message = "Blâme ajouté."
+
+        blames = deps["obtenir_blames_actifs"](guild_id)
+        par_joueur = {}
+        for b in blames:
+            par_joueur.setdefault(b["joueur_id"], []).append(b)
+
+        noms = {}
+        if g:
+            for jid in par_joueur.keys():
+                m = g.get_member(int(jid)) if jid.isdigit() else None
+                if m:
+                    noms[jid] = m.display_name
+
+        corps = render_template_string("""
+        <h1>⚖️ Blâmes — Osiris</h1>
+        <p class="muted">Serveur {{ g.name if g else guild_id }} — un blâme s'efface automatiquement 2 semaines après son ajout. Avertissement automatique à 2 blâmes, procès au-delà de {{ seuil_proces }}.</p>
+        {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        <div class="card">
+          <h2 style="margin-top:0">Infliger un blâme</h2>
+          <form method="post" class="row">
+            <input name="joueur_id" placeholder="ID Discord du joueur" required>
+            <input name="raison" placeholder="Motif du blâme" style="flex:1;min-width:220px" required>
+            <button type="submit">Ajouter</button>
+          </form>
+        </div>
+
+        {% if not par_joueur %}<div class="card">Aucun blâme actif sur ce serveur.</div>{% endif %}
+        {% for jid, liste in par_joueur.items() %}
+        <div class="card row" style="justify-content:space-between;">
+          <div>
+            <strong>{{ noms.get(jid, jid) }}</strong>
+            <div class="muted">{{ liste|length }} blâme(s) actif(s){% if liste|length > seuil_proces %} — ⚠️ seuil de procès dépassé{% endif %}</div>
+          </div>
+          <a class="btnlink" href="/admin/blames/{{ guild_id }}/{{ jid }}">Détail</a>
+        </div>
+        {% endfor %}
+        """, guild_id=guild_id, g=g, par_joueur=par_joueur, noms=noms, message=message, erreur=erreur,
+             seuil_proces=deps["seuil_proces_blame"])
+        return page_html("Blâmes", corps, connecte(), compte.get("role"))
+
+    @app.route("/admin/blames/<int:guild_id>/<joueur_id>", methods=["GET", "POST"])
+    @role_required("instructeur")
+    def admin_blame_detail(guild_id, joueur_id):
+        compte = compte_connecte()
+        if not guild_autorise(compte, guild_id):
+            abort(403)
+        g = discord.utils.get(bot.guilds, id=guild_id)
+        message = None
+        erreur = None
+
+        if request.method == "POST":
+            action = request.form.get("action")
+            if action == "ajouter":
+                raison = request.form.get("raison", "").strip()
+                if not raison:
+                    erreur = "Décris le motif du blâme."
+                else:
+                    deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
+                    deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
+                    if g:
+                        _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
+                    message = "Blâme ajouté."
+            elif action == "retirer":
+                index = int(request.form.get("index", -1))
+                retire = deps["retirer_blame_par_index"](guild_id, joueur_id, index)
+                if retire:
+                    deps["sauvegarder_log_disque"](f"🗑️ Blâme retiré au joueur {joueur_id} depuis le site par {connecte()}.")
+                    message = "Blâme retiré."
+                else:
+                    erreur = "Blâme introuvable."
+
+        actifs = deps["obtenir_blames_actifs"](guild_id, joueur_id)
+        pseudo_joueur = None
+        if g and str(joueur_id).isdigit():
+            m = g.get_member(int(joueur_id))
+            if m:
+                pseudo_joueur = m.display_name
+
+        corps = render_template_string("""
+        {% if pseudo_joueur %}
+        <h1 style="margin-bottom:2px;">{{ pseudo_joueur }}</h1>
+        <p class="muted" style="font-size:11px;margin-top:0;">ID : {{ joueur_id }}</p>
+        {% else %}
+        <h1>Blâmes — Joueur {{ joueur_id }}</h1>
+        {% endif %}
+        <p class="muted">Serveur {{ guild_id }} — {{ actifs|length }} blâme(s) actif(s){% if actifs|length > seuil_proces %} — ⚠️ seuil de procès dépassé{% endif %}</p>
+        {% if message %}<div class="flash ok">{{ message }}</div>{% endif %}
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+
+        <div class="card">
+          <h2 style="margin-top:0">Ajouter un blâme</h2>
+          <form method="post" class="row">
+            <input type="hidden" name="action" value="ajouter">
+            <input name="raison" placeholder="Motif du blâme" style="flex:1;min-width:220px" required>
+            <button type="submit">Ajouter</button>
+          </form>
+        </div>
+
+        <table>
+          <tr><th>Date</th><th>Motif</th><th></th></tr>
+          {% for b in actifs %}
+          <tr>
+            <td>{{ b.date }}</td>
+            <td>{{ b.raison }}</td>
+            <td>
+              <form method="post" class="inline" onsubmit="return confirm('Retirer ce blâme ?')">
+                <input type="hidden" name="action" value="retirer">
+                <input type="hidden" name="index" value="{{ loop.index0 }}">
+                <button class="danger" type="submit">Retirer</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+        """, actifs=actifs, joueur_id=joueur_id, guild_id=guild_id, message=message, erreur=erreur,
+             pseudo_joueur=pseudo_joueur, seuil_proces=deps["seuil_proces_blame"])
+        return page_html("Blâme — Détail", corps, connecte(), compte.get("role"))
 
     # ---------- Admin : comptes du site (instructeur et plus) ----------
 

@@ -398,6 +398,203 @@ async def envoyer_double_notification(guild, msg_ticket, msg_missions, view=None
     
     await envoyer_log_proprietaire(bot, f"[{guild.name}] {msg_missions}", view=VueEvaluationMissionMP if view else None, guild_target=guild, joueur_id_target=joueur_id)
 
+# ================= SYSTÈME DE BLÂMES — "OSIRIS" =================
+# Module disciplinaire, distinct de la gestion des missions (Valerius).
+# Règles :
+#  - un blâme s'efface automatiquement 2 semaines après son ajout ;
+#  - dès 2 blâmes actifs, un avertissement officiel est envoyé automatiquement
+#    (un bouton permet aussi de le déclencher manuellement à tout moment) ;
+#  - au-delà de 7 blâmes actifs (donc à partir du 8e), un procès est ouvert :
+#    le Palais Royal est notifié dans son salon dédié.
+# Le site web peut ajouter/retirer un blâme via /admin/blames/<guild_id>.
+
+DUREE_EXPIRATION_BLAME = timedelta(days=14)
+SEUIL_AVERTISSEMENT_BLAME = 2
+SEUIL_PROCES_BLAME = 7
+
+def get_blames_file(guild_id):
+    return f"valerius_blames_{guild_id}.json"
+
+def charger_blames(guild_id):
+    file_name = get_blames_file(guild_id)
+    if not os.path.exists(file_name): return []
+    try:
+        with open(file_name, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def sauvegarder_blames(guild_id, blames):
+    with open(get_blames_file(guild_id), "w", encoding="utf-8") as f:
+        json.dump(blames, f, indent=4, ensure_ascii=False)
+
+def nettoyer_blames_expires(guild_id):
+    """Retire les blâmes vieux de plus de DUREE_EXPIRATION_BLAME (2 semaines).
+    Retourne (blames_actifs, blames_expires_retires)."""
+    blames = charger_blames(guild_id)
+    limite = datetime.now() - DUREE_EXPIRATION_BLAME
+    actifs, expires = [], []
+    for b in blames:
+        try:
+            date_b = datetime.strptime(b.get("date", ""), "%d/%m/%Y à %H:%M")
+        except (ValueError, TypeError):
+            actifs.append(b)
+            continue
+        (actifs if date_b >= limite else expires).append(b)
+    if expires:
+        sauvegarder_blames(guild_id, actifs)
+    return actifs, expires
+
+def obtenir_blames_actifs(guild_id, joueur_id=None):
+    actifs, _ = nettoyer_blames_expires(guild_id)
+    if joueur_id is not None:
+        return [b for b in actifs if str(b.get("joueur_id")) == str(joueur_id)]
+    return actifs
+
+def ajouter_blame(guild_id, joueur_id, raison, auteur_id):
+    """Ajoute un blâme. Retourne (blame_créé, nombre_de_blâmes_actifs_du_joueur)."""
+    actifs, _ = nettoyer_blames_expires(guild_id)
+    nouveau = {
+        "joueur_id": str(joueur_id),
+        "raison": raison,
+        "auteur_id": str(auteur_id),
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+    }
+    actifs.append(nouveau)
+    sauvegarder_blames(guild_id, actifs)
+    nb_joueur = len([b for b in actifs if str(b["joueur_id"]) == str(joueur_id)])
+    return nouveau, nb_joueur
+
+def retirer_blame_par_index(guild_id, joueur_id, index):
+    """Retire le blâme à la position `index` (0-based) dans la liste des
+    blâmes actifs de CE joueur (même ordre que obtenir_blames_actifs).
+    Retourne le blâme retiré, ou None si introuvable."""
+    actifs, _ = nettoyer_blames_expires(guild_id)
+    joueur_id = str(joueur_id)
+    indices_joueur = [i for i, b in enumerate(actifs) if str(b.get("joueur_id")) == joueur_id]
+    if not (0 <= index < len(indices_joueur)):
+        return None
+    i_reel = indices_joueur[index]
+    retire = actifs.pop(i_reel)
+    sauvegarder_blames(guild_id, actifs)
+    return retire
+
+def _lister_guildes_avec_fichier(prefixe, suffixe=".json"):
+    ids = []
+    try:
+        for nom in os.listdir("."):
+            if nom.startswith(prefixe) and nom.endswith(suffixe):
+                coeur = nom[len(prefixe):-len(suffixe)]
+                if coeur.isdigit():
+                    ids.append(int(coeur))
+    except Exception:
+        pass
+    return ids
+
+class VueAvertirJoueur(VueVerrouillable):
+    """Bouton permettant au staff d'envoyer un avertissement officiel à
+    tout moment, indépendamment du seuil automatique de 2 blâmes."""
+    def __init__(self, joueur_id=None):
+        super().__init__(timeout=None)
+        self.joueur_id = joueur_id
+
+    @discord.ui.button(label="⚠️ Avertir maintenant", style=discord.ButtonStyle.danger, custom_id="valerius_avertir_manuel")
+    async def avertir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not verifier_permissions_staff(interaction.user):
+            await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+            return
+        if not self.joueur_id:
+            await interaction.response.send_message("❌ Impossible de retrouver le joueur concerné par ce blâme.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok = await envoyer_avertissement(interaction.guild, self.joueur_id, interaction.user)
+        if ok:
+            await interaction.followup.send(f"⚠️ Avertissement envoyé à <@{self.joueur_id}>.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Impossible d'envoyer l'avertissement (joueur introuvable ou MP fermés, et salon du Palais Royal introuvable).", ephemeral=True)
+
+async def envoyer_avertissement(guild, joueur_id, auteur=None):
+    """Envoie un avertissement (embed) en MP au joueur + log dans le salon
+    du Palais Royal. Retourne True si au moins une notification est partie."""
+    envoye = False
+    nb_actifs = len(obtenir_blames_actifs(guild.id, joueur_id))
+    embed = discord.Embed(
+        title="⚠️ Avertissement Officiel — Osiris",
+        description=(
+            f"Vous avez fait l'objet de **{nb_actifs} blâme(s)** actif(s) au sein du Royaume.\n"
+            "Ceci est un avertissement formel : toute récidive pourra entraîner des sanctions plus lourdes, "
+            "jusqu'au procès devant le Palais Royal."
+        ),
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"{guild.name} • Système disciplinaire Osiris")
+
+    membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
+    if membre:
+        try:
+            await membre.send(embed=embed)
+            envoye = True
+        except Exception:
+            pass
+
+    salon_cible = guild.get_channel(SALON_PALAIS_ROYAL_ID)
+    if salon_cible:
+        try:
+            mention_auteur = f" (déclenché par {auteur.mention})" if auteur else " (déclenché automatiquement)"
+            await salon_cible.send(f"⚠️ Avertissement envoyé à <@{joueur_id}>{mention_auteur}.", embed=embed)
+            envoye = True
+        except Exception:
+            pass
+
+    await envoyer_log_proprietaire(bot, f"[{guild.name}] ⚠️ Avertissement envoyé à <@{joueur_id}> ({nb_actifs} blâme(s) actif(s)).")
+    return envoye
+
+async def declencher_proces(guild, joueur_id, blames_actifs):
+    """Ouvre un procès : notifie et ping le Palais Royal dans son salon dédié."""
+    role_palais = discord.utils.get(guild.roles, name="[ Palais Royal ]") or discord.utils.get(guild.roles, name="Palais Royal")
+    salon_cible = guild.get_channel(SALON_PALAIS_ROYAL_ID)
+    mention_role = role_palais.mention if role_palais else "@Palais Royal"
+
+    embed = discord.Embed(
+        title="🚨 Ouverture d'un Procès Royal",
+        description=f"<@{joueur_id}> cumule désormais **{len(blames_actifs)} blâmes actifs** — le seuil de {SEUIL_PROCES_BLAME} est dépassé.",
+        color=discord.Color.red()
+    )
+    liste_raisons = "\n".join(f"**{i}.** {b['raison']} *({b['date']})*" for i, b in enumerate(blames_actifs, start=1))
+    if liste_raisons:
+        embed.add_field(name="Motifs des blâmes", value=liste_raisons[:1024], inline=False)
+    embed.set_footer(text=f"{guild.name} • Système disciplinaire Osiris")
+
+    if salon_cible:
+        try:
+            await salon_cible.send(f"🚨 {mention_role} ! Un procès doit être ouvert contre <@{joueur_id}>.", embed=embed)
+        except Exception as e:
+            print(f"Erreur envoi procès: {e}")
+    await envoyer_log_proprietaire(bot, f"[{guild.name}] 🚨 PROCÈS déclenché contre <@{joueur_id}> ({len(blames_actifs)} blâmes actifs).")
+
+async def traiter_seuils_blame(guild, joueur_id):
+    """À appeler après l'ajout d'un blâme (commande ou site web) : déclenche
+    avertissement / procès si les seuils sont franchis."""
+    actifs = obtenir_blames_actifs(guild.id, joueur_id)
+    nb = len(actifs)
+    if nb == SEUIL_AVERTISSEMENT_BLAME:
+        await envoyer_avertissement(guild, joueur_id)
+    if nb > SEUIL_PROCES_BLAME:
+        await declencher_proces(guild, joueur_id, actifs)
+
+@tasks.loop(hours=2)
+async def verifier_blames_expires_periodique():
+    for g_id in _lister_guildes_avec_fichier("valerius_blames_"):
+        nettoyer_blames_expires(g_id)
+
+@verifier_blames_expires_periodique.before_loop
+async def avant_verifier_blames_expires_periodique():
+    await bot.wait_until_ready()
+
+@verifier_blames_expires_periodique.error
+async def verifier_blames_expires_periodique_erreur(erreur):
+    print(f"[BLÂMES] Erreur boucle de nettoyage : {erreur}")
+
 class VueFermerTicket(VueVerrouillable):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1472,6 +1669,7 @@ async def liste_supermodos(interaction: discord.Interaction):
 async def on_ready():
     if not verifier_temps_missions.is_running(): verifier_temps_missions.start()
     if not sauvegarde_automatique.is_running(): sauvegarde_automatique.start()
+    if not verifier_blames_expires_periodique.is_running(): verifier_blames_expires_periodique.start()
     
     bot.add_view(VueBoutonTicket())
     bot.add_view(VueFermerTicket())
@@ -1479,6 +1677,7 @@ async def on_ready():
     bot.add_view(VueAccueilArrivant())
     bot.add_view(VueGestionJoueurMission())
     bot.add_view(VueEvaluationMission())
+    bot.add_view(VueAvertirJoueur())
 
     await site_web.initialiser_compte_proprietaire(envoyer_log_proprietaire, bot)
 
@@ -2238,7 +2437,12 @@ async def tutoadm(interaction: discord.Interaction):
         inline=False
     )
     embed_tuto.add_field(
-        name="🛡️ 3. Ton rang sur ce serveur",
+        name="⚖️ 3. Décrets & Discipline (Osiris)",
+        value="`/rankup @joueur @nouveau_rang` -> Publie le Décret Royal de promotion (retire aussi l'ancien rôle si précisé)\n`/blam @joueur [raison]` -> Inflige un blâme (expire seul après 2 semaines ; avertissement auto à 2, procès au-delà de 7)\n`/blames @joueur` -> Liste ses blâmes actifs\n`/retirerblam @joueur [numero]` -> Retire un blâme précis (gérable aussi depuis le site web)",
+        inline=False
+    )
+    embed_tuto.add_field(
+        name="🛡️ 4. Ton rang sur ce serveur",
         value=(f"🛡️ Super Modo (limité à **{interaction.guild.name}**)" if est_super_modo(interaction.user.id, interaction.guild.id) and not est_proprietaire(interaction.user.id)
                else "👑 Propriétaire (accès total, tous serveurs)" if est_proprietaire(interaction.user.id)
                else "🚨 Staff (rôle/permission du serveur)"),
@@ -2246,7 +2450,7 @@ async def tutoadm(interaction: discord.Interaction):
     )
     if est_proprietaire(interaction.user.id):
         embed_tuto.add_field(
-            name="👑 4. Réservé aux Propriétaires",
+            name="👑 5. Réservé aux Propriétaires",
             value="`/total_backup` & `/total_restore` -> Sauvegarde/Restauration de **TOUS** les serveurs\n`/ajouter_proprietaire` / `/retirer_proprietaire` / `/liste_proprietaires`\n`/nommer_supermodo` / `/revoquer_supermodo` -> Un Super Modo n'agit que sur le serveur où il est nommé\n`/changer_code` -> Code d'activation global",
             inline=False
         )
@@ -2373,6 +2577,103 @@ async def delmission(interaction: discord.Interaction, categorie: str, numero: i
     else:
         await interaction.response.send_message("❌ Numéro introuvable dans cette catégorie.", ephemeral=True)
 
+@bot.tree.command(name="rankup", description="Décret Royal : promeut un joueur à un nouveau rang et publie l'annonce officielle.")
+@app_commands.describe(
+    joueur="Le citoyen promu",
+    nouveau_rang="Le rôle Discord correspondant au nouveau rang",
+    ancien_rang="(Optionnel) Rôle à retirer au joueur",
+    salon="(Optionnel) Salon où publier le décret (par défaut : salon actuel)"
+)
+async def rankup(interaction: discord.Interaction, joueur: discord.Member, nouveau_rang: discord.Role, ancien_rang: discord.Role = None, salon: discord.TextChannel = None):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    erreurs = []
+    try:
+        await joueur.add_roles(nouveau_rang, reason=f"Rankup automatique par {interaction.user}")
+    except Exception as e:
+        erreurs.append(f"Impossible d'ajouter le rôle **{nouveau_rang.name}** : {e}")
+
+    if ancien_rang:
+        try:
+            await joueur.remove_roles(ancien_rang, reason=f"Rankup automatique par {interaction.user}")
+        except Exception as e:
+            erreurs.append(f"Impossible de retirer le rôle **{ancien_rang.name}** : {e}")
+
+    salon_cible = salon or interaction.channel
+    message_decret = (
+        "◈═══════◈ ◈═══════◈ **Décret Royal** ◈═══════◈ ◈═══════◈\n\n"
+        f"Pour son engagement, sa loyauté et ses services envers le Royaume, {joueur.mention} est officiellement promu au rang de {nouveau_rang.mention}.\n\n"
+        f"Que cette promotion soit portée avec honneur et marque le début de nouvelles responsabilités. Félicitations à {joueur.mention} ! 🇲🇬\n\n"
+        "*Hasina ho an'ny Fanjakana! Gloire au Royaume.*"
+    )
+    try:
+        await salon_cible.send(message_decret)
+    except Exception as e:
+        erreurs.append(f"Impossible d'envoyer le décret dans {salon_cible.mention} : {e}")
+
+    await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] 👑 Rankup : {joueur} promu à {nouveau_rang.name} par {interaction.user}.")
+
+    if erreurs:
+        await interaction.followup.send("⚠️ Décret publié avec des erreurs :\n" + "\n".join(erreurs), ephemeral=True)
+    else:
+        await interaction.followup.send(f"✅ Décret Royal publié dans {salon_cible.mention} !", ephemeral=True)
+
+@bot.tree.command(name="blam", description="Inflige un blâme à un joueur (expire automatiquement après 2 semaines).")
+@app_commands.describe(joueur="Le citoyen concerné", raison="Motif du blâme")
+async def blam(interaction: discord.Interaction, joueur: discord.Member, raison: str):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    await interaction.response.defer()
+
+    _, nb = ajouter_blame(interaction.guild.id, joueur.id, raison, interaction.user.id)
+
+    embed = discord.Embed(
+        title="⚖️ Blâme infligé — Osiris",
+        description=f"{joueur.mention} reçoit un blâme.",
+        color=discord.Color.dark_gold()
+    )
+    embed.add_field(name="Motif", value=raison, inline=False)
+    embed.add_field(name="Blâmes actifs", value=f"**{nb}** — un procès s'ouvre au-delà de {SEUIL_PROCES_BLAME}", inline=False)
+    embed.set_footer(text=f"Infligé par {interaction.user.display_name} • Expire dans 2 semaines")
+
+    await interaction.followup.send(embed=embed, view=VueAvertirJoueur(joueur.id))
+    await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] ⚖️ Blâme infligé à {joueur} par {interaction.user} : {raison} ({nb} actif(s)).")
+
+    await traiter_seuils_blame(interaction.guild, joueur.id)
+
+@bot.tree.command(name="blames", description="Affiche les blâmes actifs d'un joueur.")
+@app_commands.describe(joueur="Le citoyen concerné")
+async def blames(interaction: discord.Interaction, joueur: discord.Member):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    actifs = obtenir_blames_actifs(interaction.guild.id, joueur.id)
+    if not actifs:
+        await interaction.response.send_message(f"✅ {joueur.mention} n'a aucun blâme actif.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"⚖️ Blâmes actifs de {joueur.display_name}", color=discord.Color.dark_gold())
+    for i, b in enumerate(actifs, start=1):
+        embed.add_field(name=f"Blâme n°{i} — {b['date']}", value=b['raison'], inline=False)
+    embed.set_footer(text=f"{len(actifs)} blâme(s) actif(s) • Un blâme expire 2 semaines après son ajout • Procès au-delà de {SEUIL_PROCES_BLAME}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="retirerblam", description="Retire un blâme précis d'un joueur (numéro visible via /blames).")
+@app_commands.describe(joueur="Le citoyen concerné", numero="Le numéro du blâme à retirer (voir /blames)")
+async def retirerblam(interaction: discord.Interaction, joueur: discord.Member, numero: int):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    retire = retirer_blame_par_index(interaction.guild.id, joueur.id, numero - 1)
+    if retire:
+        await interaction.response.send_message(f"🗑️ Blâme n°{numero} retiré à {joueur.mention}.", ephemeral=True)
+        await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] 🗑️ Blâme retiré à {joueur} par {interaction.user} (raison retirée : {retire['raison']}).")
+    else:
+        await interaction.response.send_message("❌ Blâme introuvable pour ce joueur (vérifie le numéro avec /blames).", ephemeral=True)
+
 # ================= SITE WEB D'ADMINISTRATION =================
 # Même app Flask que keep_alive() : un seul process, un seul serveur Render.
 site_web.configurer_site(app, bot, {
@@ -2402,6 +2703,11 @@ site_web.configurer_site(app, bot, {
     "action_refuser_mission": action_refuser_mission,
     "envoyer_double_notification": envoyer_double_notification,
     "formater_duree": formater_duree,
+    "obtenir_blames_actifs": obtenir_blames_actifs,
+    "ajouter_blame": ajouter_blame,
+    "retirer_blame_par_index": retirer_blame_par_index,
+    "traiter_seuils_blame": traiter_seuils_blame,
+    "seuil_proces_blame": SEUIL_PROCES_BLAME,
 })
 
 keep_alive()
