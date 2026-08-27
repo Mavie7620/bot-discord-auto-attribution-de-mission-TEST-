@@ -1912,6 +1912,39 @@ def configurer_site(app, bot, deps):
         except Exception as e:
             print(f"[BLÂMES SITE] Erreur exécution async : {e}")
 
+    def _resoudre_joueur(g, texte):
+        """Accepte soit un ID Discord, soit un pseudo/pseudo serveur/nom
+        d'utilisateur, et retourne (id_str, erreur). Si plusieurs membres
+        correspondent au pseudo saisi, retourne une erreur demandant de
+        préciser (ou d'utiliser l'ID)."""
+        texte = (texte or "").strip()
+        if not texte:
+            return None, "Indique un pseudo ou un ID Discord de joueur."
+        if texte.isdigit():
+            return texte, None
+        if not g:
+            return None, "Serveur introuvable pour rechercher ce pseudo."
+        recherche = texte.lstrip("@").lower()
+        exactes = [
+            m for m in g.members
+            if m.display_name.lower() == recherche
+            or m.name.lower() == recherche
+            or (getattr(m, "global_name", None) or "").lower() == recherche
+        ]
+        if len(exactes) == 1:
+            return str(exactes[0].id), None
+        if len(exactes) > 1:
+            return None, f"Plusieurs membres correspondent au pseudo « {texte} », précise-le ou utilise son ID Discord."
+        partielles = [
+            m for m in g.members
+            if recherche in m.display_name.lower() or recherche in m.name.lower()
+        ]
+        if len(partielles) == 1:
+            return str(partielles[0].id), None
+        if len(partielles) > 1:
+            return None, f"Plusieurs membres correspondent au pseudo « {texte} », précise-le ou utilise son ID Discord."
+        return None, f"Aucun membre trouvé avec le pseudo « {texte} »."
+
     @app.route("/admin/blames/<int:guild_id>", methods=["GET", "POST"])
     @role_required("instructeur")
     def admin_blames(guild_id):
@@ -1923,17 +1956,21 @@ def configurer_site(app, bot, deps):
         erreur = None
 
         if request.method == "POST":
-            joueur_id = request.form.get("joueur_id", "").strip()
+            joueur_saisi = request.form.get("joueur_id", "").strip()
             raison = request.form.get("raison", "").strip()
-            if not joueur_id.isdigit() or not raison:
-                erreur = "Indique un ID Discord de joueur valide et un motif."
+            if not joueur_saisi or not raison:
+                erreur = "Indique un pseudo (ou ID Discord) de joueur et un motif."
             else:
-                nouveau, nb = deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
-                deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
-                if g:
-                    _executer_async_blame(deps["envoyer_notification_blame"](g, nouveau, nb))
-                    _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
-                message = "Blâme ajouté."
+                joueur_id, erreur_resolution = _resoudre_joueur(g, joueur_saisi)
+                if erreur_resolution:
+                    erreur = erreur_resolution
+                else:
+                    nouveau, nb = deps["ajouter_blame"](guild_id, joueur_id, raison, compte.get("discord_id") or "site")
+                    deps["sauvegarder_log_disque"](f"⚖️ Blâme ajouté au joueur {joueur_id} depuis le site par {connecte()}.")
+                    if g:
+                        _executer_async_blame(deps["envoyer_notification_blame"](g, nouveau, nb))
+                        _executer_async_blame(deps["traiter_seuils_blame"](g, joueur_id))
+                    message = "Blâme ajouté."
 
         blames = deps["obtenir_blames_actifs"](guild_id)
         par_joueur = {}
@@ -1956,7 +1993,7 @@ def configurer_site(app, bot, deps):
         <div class="card">
           <h2 style="margin-top:0">Infliger un blâme</h2>
           <form method="post" class="row">
-            <input name="joueur_id" placeholder="ID Discord du joueur" required>
+            <input name="joueur_id" placeholder="Pseudo ou ID Discord du joueur" required>
             <input name="raison" placeholder="Motif du blâme" style="flex:1;min-width:220px" required>
             <button type="submit">Ajouter</button>
           </form>
