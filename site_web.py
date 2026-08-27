@@ -964,6 +964,10 @@ def configurer_site(app, bot, deps):
           <div><strong>👤 Comptes</strong><div class="muted">Créer, modifier ou supprimer les comptes du site.</div></div>
           <a class="btnlink" href="/admin/comptes">Ouvrir</a>
         </div>
+        <div class="card row" style="justify-content:space-between;">
+          <div><strong>🔮 Intelligence Royale (IA)</strong><div class="muted">Poser une question à l'IA du bot directement depuis le site.</div></div>
+          <a class="btnlink" href="/admin/ia">Ouvrir</a>
+        </div>
 
         {% if super_admin %}
         <div class="card row" style="justify-content:space-between;">
@@ -2477,6 +2481,64 @@ def configurer_site(app, bot, deps):
              nom_serveur_acteur=noms_guildes.get(str(acteur.get("guild_id"))), connecte_login=connecte(),
              peut_gerer=peut_gerer, confirmation_en_attente=confirmation_en_attente)
         return page_html("Comptes", corps, connecte(), acteur_role)
+
+    # ---------- Admin : Intelligence Royale (IA, gratuite via Groq) ----------
+
+    @app.route("/admin/ia", methods=["GET", "POST"])
+    @role_required("instructeur")
+    def admin_ia():
+        """Permet de poser une question à l'IA du bot directement depuis le
+        site, sans passer par Discord. Chaque compte connecté a sa propre
+        mémoire de conversation (clé ("site", login)), séparée de celles
+        utilisées côté Discord."""
+        compte = compte_connecte()
+        cle_ia = ("site", connecte())
+        reponse = None
+        erreur = None
+
+        if request.method == "POST":
+            if request.form.get("reset"):
+                deps["reinitialiser_historique_ia_cle"](cle_ia)
+            else:
+                question = request.form.get("question", "").strip()
+                if not question:
+                    erreur = "Écris une question avant d'envoyer."
+                else:
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(
+                            deps["interroger_ia"](cle_ia, question), bot.loop
+                        )
+                        reponse, erreur_ia = future.result(timeout=30)
+                        if erreur_ia:
+                            erreur = erreur_ia
+                    except Exception as e:
+                        erreur = f"❌ Erreur lors de la requête à l'IA : {e}"
+
+        corps = render_template_string("""
+        <h1>🔮 Intelligence Royale de Valerius</h1>
+        <p class="muted">Pose une question à l'IA du bot directement depuis le site (mémoire de conversation propre à ton compte, indépendante de Discord).</p>
+        {% if erreur %}<div class="flash erreur">{{ erreur }}</div>{% endif %}
+        {% if reponse %}
+        <div class="card">
+          <strong>🔮 Réponse :</strong>
+          <p style="white-space:pre-wrap;">{{ reponse }}</p>
+        </div>
+        {% endif %}
+        <div class="card">
+          <form method="post">
+            <p>
+              <textarea name="question" rows="4" placeholder="Ta question..." required
+                style="width:100%;font-family:inherit;font-size:14px;padding:12px 15px;border-radius:10px;border:1px solid var(--border);background:var(--bg-soft);color:var(--text)"></textarea>
+            </p>
+            <button type="submit">Envoyer</button>
+          </form>
+          <form method="post" style="margin-top:10px;">
+            <input type="hidden" name="reset" value="1">
+            <button type="submit" style="background:transparent;border:1px solid var(--border);">🧹 Réinitialiser la mémoire</button>
+          </form>
+        </div>
+        """, reponse=reponse, erreur=erreur)
+        return page_html("Intelligence Royale", corps, connecte(), compte.get("role"))
 
     # ---------- Admin : sauvegardes (proprietaire uniquement — accès total) ----------
 

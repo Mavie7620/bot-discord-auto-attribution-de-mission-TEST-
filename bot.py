@@ -13,6 +13,7 @@ from flask import Flask
 from datetime import datetime, timedelta
 import io
 import site_web
+from groq import AsyncGroq
 
 app = Flask('')
 
@@ -52,6 +53,85 @@ ATTENTE_MOOV_ID = 1534604587992875280
 SALON_PALAIS_ROYAL_ID = 1519322938430722129
 SALON_VALIDATION_MISSION_ID = 1534638388286853273
 SALON_ANNONCE_MAINTENANCE_ID = 1517995293944057867
+
+# ================= INTELLIGENCE ROYALE DE VALERIUS (IA — Groq, gratuit) =================
+# Utilise l'API Groq (gratuite, https://console.groq.com) pour répondre aux
+# questions des joueurs. Anciennement propulsée par Claude (Anthropic, payant) ;
+# remplacée par Groq, qui donne accès gratuitement à des modèles open-source
+# (Llama 3.3) largement suffisants pour cet usage, avec une API très proche.
+# Clé API à définir sur Render (ou en local) via la variable d'environnement
+# GROQ_API_KEY. Sans clé, la commande /ia (et la page du site) répondent
+# simplement que l'IA n'est pas configurée, sans faire planter le bot.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+IA_MAX_TOKENS = 1024
+
+client_ia = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+VALERIUS_IA_SYSTEM_PROMPT = (
+    "Tu es l'Intelligence Royale de Valerius, un conseiller virtuel au service d'un "
+    "Royaume géré sur Discord. Tu réponds aux joueurs et au staff avec courtoisie, "
+    "clarté et un ton légèrement noble/royal, sans exagérer. Tu peux aider sur "
+    "n'importe quel sujet (questions générales, aide sur le serveur, conseils, etc.). "
+    "Reste concis : tes réponses doivent tenir dans un message Discord (évite les "
+    "réponses interminables sauf si on te le demande explicitement)."
+)
+
+# Mémoire de conversation en RAM (non persistée entre redémarrages), pour que
+# l'IA garde le contexte des derniers échanges d'un joueur sur un salon donné.
+IA_HISTORIQUE_MAX_MESSAGES = 10  # nombre de messages (user+assistant) conservés
+_ia_historique = {}  # {(guild_id, channel_id, user_id): [ {"role":..., "content":...}, ... ]}
+
+def _cle_ia(interaction: discord.Interaction):
+    g_id = interaction.guild.id if interaction.guild else 0
+    return (g_id, interaction.channel_id, interaction.user.id)
+
+def reinitialiser_historique_ia(interaction: discord.Interaction):
+    _ia_historique.pop(_cle_ia(interaction), None)
+
+def reinitialiser_historique_ia_cle(cle):
+    """Variante générique (utilisée aussi par le site web) : efface
+    l'historique d'une clé quelconque, sans passer par une interaction Discord."""
+    _ia_historique.pop(cle, None)
+
+async def interroger_ia(cle, question: str):
+    """Envoie la question (+ historique récent lié à `cle`) à l'IA (Groq).
+    Retourne (texte, erreur). `cle` identifie la conversation : peut venir
+    de _cle_ia(interaction) côté Discord, ou d'une clé propre au site web
+    (ex: ("site", login)), pour que chacun garde son propre historique."""
+    if not client_ia:
+        return None, "❌ L'Intelligence Royale n'est pas configurée : aucune clé API Groq (variable `GROQ_API_KEY`) n'a été définie."
+    historique = _ia_historique.get(cle, [])
+    messages = [{"role": "system", "content": VALERIUS_IA_SYSTEM_PROMPT}] + historique + [{"role": "user", "content": question}]
+    try:
+        reponse = await client_ia.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=IA_MAX_TOKENS,
+            messages=messages,
+        )
+        texte = (reponse.choices[0].message.content or "").strip()
+        if not texte:
+            return "🤖 *(l'IA n'a renvoyé aucun texte, réessaie ta question)*", None
+        historique = historique + [{"role": "user", "content": question}, {"role": "assistant", "content": texte}]
+        _ia_historique[cle] = historique[-IA_HISTORIQUE_MAX_MESSAGES:]
+        return texte, None
+    except Exception as e:
+        return None, f"❌ Erreur lors de la requête à l'IA : {e}"
+
+def decouper_texte(texte, taille=4000):
+    """Découpe un texte en morceaux <= taille, sans couper un mot en deux si possible."""
+    morceaux = []
+    while len(texte) > taille:
+        point_coupe = texte.rfind("\n", 0, taille)
+        if point_coupe == -1:
+            point_coupe = texte.rfind(" ", 0, taille)
+        if point_coupe == -1:
+            point_coupe = taille
+        morceaux.append(texte[:point_coupe])
+        texte = texte[point_coupe:].lstrip()
+    if texte:
+        morceaux.append(texte)
+    return morceaux
 
 def get_file_name(guild_id):
     return f"valerius_missions_{guild_id}.txt"
@@ -645,6 +725,62 @@ async def traiter_seuils_blame(guild, joueur_id):
         await envoyer_avertissement(guild, joueur_id)
     if nb > SEUIL_PROCES_BLAME:
         await declencher_proces(guild, joueur_id, actifs)
+
+# ================= SYSTÈME DE RANKUP / DÉRANK — "OSIRIS" =================
+# Historique des changements de rang (promotions & rétrogradations), géré
+# entièrement par Osiris (comme le système de blâmes). Chaque événement est
+# conservé pour pouvoir être consulté avec /rangs.
+
+def get_rankups_file(guild_id):
+    return f"osiris_rankups_{guild_id}.json"
+
+def charger_rankups(guild_id):
+    file_name = get_rankups_file(guild_id)
+    if not os.path.exists(file_name): return []
+    try:
+        with open(file_name, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def sauvegarder_rankups(guild_id, rankups):
+    with open(get_rankups_file(guild_id), "w", encoding="utf-8") as f:
+        json.dump(rankups, f, indent=4, ensure_ascii=False)
+
+def ajouter_rankup(guild_id, joueur_id, type_action, ancien_rang, nouveau_rang, auteur_id, raison=None):
+    """type_action : 'promotion' ou 'retrogradation'. Retourne l'entrée créée."""
+    rankups = charger_rankups(guild_id)
+    entree = {
+        "joueur_id": str(joueur_id),
+        "type": type_action,
+        "ancien_rang": ancien_rang,
+        "nouveau_rang": nouveau_rang,
+        "auteur_id": str(auteur_id),
+        "raison": raison,
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+    }
+    rankups.insert(0, entree)
+    sauvegarder_rankups(guild_id, rankups)
+    return entree
+
+def obtenir_rankups(guild_id, joueur_id=None):
+    rankups = charger_rankups(guild_id)
+    if joueur_id is not None:
+        return [r for r in rankups if str(r.get("joueur_id")) == str(joueur_id)]
+    return rankups
+
+def retirer_rankup_par_index(guild_id, joueur_id, index):
+    """Retire l'entrée à la position `index` (0-based) dans l'historique de
+    CE joueur (même ordre que obtenir_rankups, du plus récent au plus ancien)."""
+    rankups = charger_rankups(guild_id)
+    joueur_id = str(joueur_id)
+    indices_joueur = [i for i, r in enumerate(rankups) if str(r.get("joueur_id")) == joueur_id]
+    if not (0 <= index < len(indices_joueur)):
+        return None
+    i_reel = indices_joueur[index]
+    retire = rankups.pop(i_reel)
+    sauvegarder_rankups(guild_id, rankups)
+    return retire
 
 @tasks.loop(hours=2)
 async def verifier_blames_expires_periodique():
@@ -2519,8 +2655,13 @@ async def tutoadm(interaction: discord.Interaction):
         inline=False
     )
     embed_tuto.add_field(
-        name="⚖️ 3. Décrets & Discipline",
-        value="`/rankup @joueur @nouveau_rang` -> Publie le Décret Royal de promotion (retire aussi l'ancien rôle si précisé)\n\n**Sur le bot Osiris (⚖️) :**\n`/blam @joueur [raison]` -> Inflige un blâme (expire seul après 2 semaines ; avertissement auto à 2, procès au-delà de 7)\n`/blames @joueur` -> Liste ses blâmes actifs\n`/retirerblam @joueur [numero]` -> Retire un blâme précis (gérable aussi depuis le site web)",
+        name="⚖️ 3. Décrets & Discipline (sur le bot Osiris ⚖️)",
+        value="`/rankup @joueur @nouveau_rang` -> Publie le Décret Royal de promotion (retire aussi l'ancien rôle si précisé)\n`/derank @joueur @ancien_rang` -> Publie le Décret de Rétrogradation (attribue un nouveau rôle si précisé)\n`/rangs @joueur` -> Historique des rankups/déranks du joueur\n`/retirerrang @joueur [numero]` -> Retire une entrée de l'historique des rangs\n\n`/blam @joueur [raison]` -> Inflige un blâme (expire seul après 2 semaines ; avertissement auto à 2, procès au-delà de 7)\n`/blames @joueur` -> Liste ses blâmes actifs\n`/retirerblam @joueur [numero]` -> Retire un blâme précis (gérable aussi depuis le site web)",
+        inline=False
+    )
+    embed_tuto.add_field(
+        name="🔮 3bis. Intelligence Royale (IA — Valerius)",
+        value="`/ia [question]` -> Pose une question à l'IA de Valerius (gratuite, aussi accessible depuis le site)\n`/ia_reset` -> Réinitialise la mémoire de conversation de l'IA sur ce salon",
         inline=False
     )
     embed_tuto.add_field(
@@ -2659,7 +2800,34 @@ async def delmission(interaction: discord.Interaction, categorie: str, numero: i
     else:
         await interaction.response.send_message("❌ Numéro introuvable dans cette catégorie.", ephemeral=True)
 
-@bot.tree.command(name="rankup", description="Décret Royal : promeut un joueur à un nouveau rang et publie l'annonce officielle.")
+# ================= INTELLIGENCE ROYALE DE VALERIUS (commandes) =================
+@bot.tree.command(name="ia", description="Pose une question à l'Intelligence Royale de Valerius (IA gratuite).")
+@app_commands.describe(question="Ta question pour l'IA")
+async def ia(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(thinking=True)
+    texte, erreur = await interroger_ia(_cle_ia(interaction), question)
+    if erreur:
+        await interaction.followup.send(erreur, ephemeral=True)
+        return
+
+    morceaux = decouper_texte(texte, 4000)
+    premier_embed = discord.Embed(
+        title="🔮 Intelligence Royale de Valerius",
+        description=morceaux[0],
+        color=discord.Color.blurple()
+    )
+    premier_embed.set_footer(text=f"Demandé par {interaction.user.display_name}")
+    await interaction.followup.send(embed=premier_embed)
+    for suite in morceaux[1:]:
+        await interaction.channel.send(embed=discord.Embed(description=suite, color=discord.Color.blurple()))
+
+@bot.tree.command(name="ia_reset", description="Efface la mémoire de conversation de l'IA pour ce salon (repart de zéro).")
+async def ia_reset(interaction: discord.Interaction):
+    reinitialiser_historique_ia(interaction)
+    await interaction.response.send_message("🧹 Mémoire de l'Intelligence Royale réinitialisée pour ce salon.", ephemeral=True)
+
+# ================= RANKUP / DÉRANK — "OSIRIS" (commandes) =================
+@bot_osiris.tree.command(name="rankup", description="Décret Royal : promeut un joueur à un nouveau rang et publie l'annonce officielle.")
 @app_commands.describe(
     joueur="Le citoyen promu",
     nouveau_rang="Le rôle Discord correspondant au nouveau rang",
@@ -2696,12 +2864,100 @@ async def rankup(interaction: discord.Interaction, joueur: discord.Member, nouve
     except Exception as e:
         erreurs.append(f"Impossible d'envoyer le décret dans {salon_cible.mention} : {e}")
 
-    await envoyer_log_proprietaire(bot, f"[{interaction.guild.name}] 👑 Rankup : {joueur} promu à {nouveau_rang.name} par {interaction.user}.")
+    ajouter_rankup(interaction.guild.id, joueur.id, "promotion", ancien_rang.name if ancien_rang else None, nouveau_rang.name, interaction.user.id)
+    await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] 👑 Rankup : {joueur} promu à {nouveau_rang.name} par {interaction.user}.")
 
     if erreurs:
         await interaction.followup.send("⚠️ Décret publié avec des erreurs :\n" + "\n".join(erreurs), ephemeral=True)
     else:
         await interaction.followup.send(f"✅ Décret Royal publié dans {salon_cible.mention} !", ephemeral=True)
+
+@bot_osiris.tree.command(name="derank", description="Rétrograde un joueur : retire son rang et publie l'annonce officielle.")
+@app_commands.describe(
+    joueur="Le citoyen rétrogradé",
+    ancien_rang="Le rôle Discord à retirer (rang actuel du joueur)",
+    nouveau_rang="(Optionnel) Rôle à attribuer après la rétrogradation",
+    raison="(Optionnel) Motif de la rétrogradation",
+    salon="(Optionnel) Salon où publier le décret (par défaut : salon actuel)"
+)
+async def derank(interaction: discord.Interaction, joueur: discord.Member, ancien_rang: discord.Role, nouveau_rang: discord.Role = None, raison: str = None, salon: discord.TextChannel = None):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    erreurs = []
+    try:
+        await joueur.remove_roles(ancien_rang, reason=f"Dérank par {interaction.user}" + (f" ({raison})" if raison else ""))
+    except Exception as e:
+        erreurs.append(f"Impossible de retirer le rôle **{ancien_rang.name}** : {e}")
+
+    if nouveau_rang:
+        try:
+            await joueur.add_roles(nouveau_rang, reason=f"Dérank par {interaction.user}" + (f" ({raison})" if raison else ""))
+        except Exception as e:
+            erreurs.append(f"Impossible d'ajouter le rôle **{nouveau_rang.name}** : {e}")
+
+    salon_cible = salon or interaction.channel
+    message_decret = (
+        "◈═══════◈ ◈═══════◈ **Décret de Rétrogradation** ◈═══════◈ ◈═══════◈\n\n"
+        f"Par ordre du Palais Royal, {joueur.mention} est rétrogradé du rang de {ancien_rang.mention}"
+        + (f" au rang de {nouveau_rang.mention}" if nouveau_rang else "")
+        + ".\n\n"
+        + (f"**Motif :** {raison}\n\n" if raison else "")
+        + "*Hasina ho an'ny Fanjakana! Gloire au Royaume.*"
+    )
+    try:
+        await salon_cible.send(message_decret)
+    except Exception as e:
+        erreurs.append(f"Impossible d'envoyer le décret dans {salon_cible.mention} : {e}")
+
+    ajouter_rankup(interaction.guild.id, joueur.id, "retrogradation", ancien_rang.name, nouveau_rang.name if nouveau_rang else None, interaction.user.id, raison)
+    await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] ⬇️ Dérank : {joueur} rétrogradé de {ancien_rang.name} par {interaction.user}" + (f" ({raison})" if raison else "") + ".")
+
+    if erreurs:
+        await interaction.followup.send("⚠️ Décret publié avec des erreurs :\n" + "\n".join(erreurs), ephemeral=True)
+    else:
+        await interaction.followup.send(f"✅ Décret de rétrogradation publié dans {salon_cible.mention} !", ephemeral=True)
+
+@bot_osiris.tree.command(name="rangs", description="Affiche l'historique des rankups/déranks d'un joueur.")
+@app_commands.describe(joueur="Le citoyen concerné")
+async def rangs(interaction: discord.Interaction, joueur: discord.Member):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    historique = obtenir_rankups(interaction.guild.id, joueur.id)
+    if not historique:
+        await interaction.response.send_message(f"ℹ️ {joueur.mention} n'a aucun changement de rang enregistré.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=f"👑 Historique des rangs de {joueur.display_name}", color=discord.Color.gold())
+    for i, r in enumerate(historique[:15], start=1):
+        promotion = r.get("type") == "promotion"
+        emoji = "⬆️" if promotion else "⬇️"
+        titre = f"{emoji} {'Promotion' if promotion else 'Rétrogradation'} n°{i} — {r.get('date', 'date inconnue')}"
+        valeur = f"{r.get('ancien_rang') or '—'} ➜ {r.get('nouveau_rang') or '—'}"
+        if r.get("raison"):
+            valeur += f"\nMotif : {r['raison']}"
+        embed.add_field(name=titre, value=valeur, inline=False)
+    if len(historique) > 15:
+        embed.set_footer(text=f"{len(historique)} changement(s) au total — les 15 plus récents sont affichés")
+    else:
+        embed.set_footer(text=f"{len(historique)} changement(s) de rang enregistré(s)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot_osiris.tree.command(name="retirerrang", description="Retire une entrée précise de l'historique des rangs d'un joueur (numéro visible via /rangs).")
+@app_commands.describe(joueur="Le citoyen concerné", numero="Le numéro de l'entrée à retirer (voir /rangs)")
+async def retirerrang(interaction: discord.Interaction, joueur: discord.Member, numero: int):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    retire = retirer_rankup_par_index(interaction.guild.id, joueur.id, numero - 1)
+    if retire:
+        await interaction.response.send_message(f"🗑️ Entrée n°{numero} retirée de l'historique des rangs de {joueur.mention}.", ephemeral=True)
+        await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] 🗑️ Entrée de rang retirée pour {joueur} par {interaction.user}.")
+    else:
+        await interaction.response.send_message("❌ Entrée introuvable pour ce joueur (vérifie le numéro avec /rangs).", ephemeral=True)
 
 @bot_osiris.tree.command(name="blam", description="Inflige un blâme à un joueur (expire automatiquement après 2 semaines).")
 @app_commands.describe(joueur="Le citoyen concerné", raison="Motif du blâme")
@@ -2793,6 +3049,8 @@ site_web.configurer_site(app, bot, {
     "traiter_seuils_blame": traiter_seuils_blame,
     "envoyer_notification_blame": envoyer_notification_blame,
     "seuil_proces_blame": SEUIL_PROCES_BLAME,
+    "interroger_ia": interroger_ia,
+    "reinitialiser_historique_ia_cle": reinitialiser_historique_ia_cle,
 })
 
 keep_alive()
