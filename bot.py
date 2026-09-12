@@ -7,12 +7,18 @@ import os
 import re
 import json
 import asyncio
+import contextlib
 import threading
 from threading import Thread
 from flask import Flask
 from datetime import datetime, timedelta
 import io
+import glob
+import base64
 import site_web
+import ia_outils
+import stockage_drive
+import requests
 from groq import AsyncGroq
 
 app = Flask('')
@@ -26,7 +32,13 @@ app = Flask('')
 @app.route('/ping')
 def home(): return "Le bot Valerius est vivant !"
 
-def run_web(): app.run(host='0.0.0.0', port=8080)
+def run_web():
+    # threaded=True : indispensable pour que le flux temps réel de la
+    # cloche 🔔 (/api/notifications/flux, une connexion HTTP maintenue
+    # ouverte) ne bloque pas les autres pages du site pendant qu'il est
+    # ouvert. Sans ça, le serveur de dev Flask traite les requêtes une par
+    # une et le site semblerait "figé" tant qu'un flux reste connecté.
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)), threaded=True)
 def keep_alive():
     t = Thread(target=run_web)
     t.start()
@@ -45,6 +57,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # comme Valerius, pour pouvoir mettre en DM et lire les rôles des joueurs.
 bot_osiris = commands.Bot(command_prefix="?", intents=intents)
 
+# Troisième bot, toujours dans le même processus : "Sirius" gère uniquement
+# le système des rangs du royaume (catalogue des rangs, demandes de
+# promotion, vérification automatique des conditions). Comme Osiris, il
+# partage tout le reste du code avec Valerius — seul son token et ses
+# commandes lui sont propres.
+# ⚠️ Sirius doit être créé sur le Discord Developer Portal (comme Valerius
+# et Osiris), invité séparément sur le serveur avec l'intent "Server Members
+# Intent" activé, et son token placé dans la variable d'environnement Render
+# "sirius_id" (même convention que "osiris_id" pour Osiris).
+bot_rangs = commands.Bot(command_prefix=">>", intents=intents)
+
 BOT_START_TIME = datetime.now()
 
 PROPRIETAIRE_ID = 1109866808321769472
@@ -53,6 +76,13 @@ ATTENTE_MOOV_ID = 1534604587992875280
 SALON_PALAIS_ROYAL_ID = 1519322938430722129
 SALON_VALIDATION_MISSION_ID = 1534638388286853273
 SALON_ANNONCE_MAINTENANCE_ID = 1517995293944057867
+# Salon où Sirius poste les demandes de rang (visible par les Haut-gradés/
+# instructeurs). Configurable via la variable d'environnement Render
+# "SALON_DEMANDES_RANG_ID" — sur Render : Environment > Add Environment
+# Variable, avec l'ID du salon Discord voulu (clic droit sur le salon en
+# mode développeur > "Copier l'identifiant"). Si la variable n'est pas
+# définie, la valeur ci-dessous sert de valeur par défaut.
+SALON_DEMANDES_RANG_ID = int(os.environ.get("SALON_DEMANDES_RANG_ID", 1519322938430722129))
 
 # ================= INTELLIGENCE ROYALE DE VALERIUS (IA — Groq, gratuit) =================
 # Utilise l'API Groq (gratuite, https://console.groq.com) pour répondre aux
@@ -72,13 +102,465 @@ IA_MAX_TOKENS = 1024
 
 client_ia = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# ================= API NATIONSGLORY (données réelles du jeu) =================
+# Jeton personnel récupéré sur https://nationsglory.readme.io (bouton "Log In"
+# / "Get API Key"), à placer dans la variable d'environnement Render
+# NATIONSGLORY_API_KEY. Sans clé, l'outil ci-dessous renvoie juste une erreur
+# exploitable par l'IA ("je n'ai pas pu vérifier"), sans jamais faire planter
+# le bot ni inventer de chiffres.
+NATIONSGLORY_API_KEY = os.environ.get("NATIONSGLORY_API_KEY")
+NATIONSGLORY_API_BASE = "https://publicapi.nationsglory.fr"
+
+
+def _outil_joueurs_en_ligne_nationsglory(contexte, serveur=None):
+    """Interroge GET /playercount sur l'API officielle NationsGlory et
+    renvoie le nombre de joueurs en ligne / la capacité max, pour le
+    serveur demandé (par défaut "mocha", notre serveur) ou pour tous les
+    serveurs si `serveur="tous"`. `contexte` n'est pas utilisé ici (donnée
+    publique, indépendante du serveur Discord) mais reste accepté pour
+    respecter la signature commune à tous les outils de ia_outils.py."""
+    if not NATIONSGLORY_API_KEY:
+        return {"erreur": "Aucune clé API NationsGlory configurée (variable NATIONSGLORY_API_KEY manquante)."}
+    try:
+        reponse = requests.get(
+            f"{NATIONSGLORY_API_BASE}/playercount",
+            headers={"Authorization": f"Bearer {NATIONSGLORY_API_KEY}"},
+            timeout=10,
+        )
+        reponse.raise_for_status()
+        donnees = reponse.json()
+    except Exception as e:
+        return {"erreur": f"Impossible de contacter l'API NationsGlory : {e}"}
+
+    serveur = (serveur or "mocha").strip().lower()
+    if serveur in ("tous", "all", ""):
+        return {"joueurs_par_serveur": donnees}
+    infos = donnees.get(serveur)
+    if not infos:
+        return {"erreur": f"Serveur « {serveur} » inconnu de l'API NationsGlory."}
+    return {"serveur": serveur, "joueurs_en_ligne": infos.get("players"), "capacite_max": infos.get("maxplayers")}
+
+
+ia_outils.enregistrer_outil(
+    nom="joueurs_en_ligne_nationsglory",
+    description=(
+        "Renvoie le nombre de joueurs actuellement en ligne (et la capacité "
+        "maximale) sur un serveur NationsGlory. À utiliser dès qu'on demande "
+        "combien de joueurs sont connectés sur le Mocha (ou un autre serveur "
+        "NationsGlory). Sans argument, répond pour le serveur Mocha."
+    ),
+    parametres={
+        "type": "object",
+        "properties": {
+            "serveur": {
+                "type": "string",
+                "description": (
+                    "Nom du serveur NationsGlory en minuscules (ex: 'mocha', 'blue', "
+                    "'orange'), ou 'tous' pour la liste complète. Par défaut : 'mocha'."
+                ),
+            }
+        },
+        "required": [],
+    },
+    executer=_outil_joueurs_en_ligne_nationsglory,
+)
+
+
+def _requete_nationsglory(chemin):
+    """Petite aide interne partagée par tous les outils NationsGlory :
+    fait un GET authentifié sur `chemin` (ex: "/user/MisterSand") et
+    renvoie un tuple (donnees, erreur) où un seul des deux est rempli.
+    Ne lève jamais d'exception : toute erreur réseau/HTTP est renvoyée
+    sous forme de message lisible, jamais une donnée inventée."""
+    if not NATIONSGLORY_API_KEY:
+        return None, "Aucune clé API NationsGlory configurée (variable NATIONSGLORY_API_KEY manquante)."
+    try:
+        reponse = requests.get(
+            f"{NATIONSGLORY_API_BASE}{chemin}",
+            headers={"Authorization": f"Bearer {NATIONSGLORY_API_KEY}"},
+            timeout=10,
+        )
+    except Exception as e:
+        return None, f"Impossible de contacter l'API NationsGlory : {e}"
+    if reponse.status_code == 400:
+        return None, "Introuvable sur NationsGlory (pseudo, pays ou serveur inconnu)."
+    try:
+        reponse.raise_for_status()
+    except Exception as e:
+        return None, f"Erreur API NationsGlory ({reponse.status_code}) : {e}"
+    try:
+        return reponse.json(), None
+    except Exception as e:
+        return None, f"Réponse invalide de l'API NationsGlory : {e}"
+
+
+def _formater_duree_secondes(secondes):
+    """Convertit une durée en secondes (playtime brut de l'API) en texte
+    lisible du style "36j 2h 15min". Renvoie None si la valeur est absente
+    ou invalide, pour laisser l'appelant décider de l'affichage."""
+    try:
+        secondes = int(secondes)
+    except (TypeError, ValueError):
+        return None
+    jours, reste = divmod(secondes, 86400)
+    heures, reste = divmod(reste, 3600)
+    minutes = reste // 60
+    morceaux = []
+    if jours:
+        morceaux.append(f"{jours}j")
+    if heures or jours:
+        morceaux.append(f"{heures}h")
+    morceaux.append(f"{minutes}min")
+    return " ".join(morceaux)
+
+
+def _outil_profil_joueur_nationsglory(contexte, pseudo, serveur=None):
+    """Interroge GET /user/{username} sur l'API officielle NationsGlory :
+    identité globale du joueur (pseudo, date de création du compte,
+    dernière connexion, skin) et, pour le serveur demandé (par défaut
+    "mocha"), ses données in-game : pays, rang, power/max_power, temps de
+    jeu, statut en ligne et compétences (mineur/bûcheron/etc.). `contexte`
+    n'est pas utilisé ici (donnée publique NationsGlory, indépendante du
+    serveur Discord) mais reste accepté pour respecter la signature
+    commune à tous les outils de ia_outils.py."""
+    pseudo = (pseudo or "").strip()
+    if not pseudo:
+        return {"erreur": "Aucun pseudo NationsGlory fourni."}
+    donnees, erreur = _requete_nationsglory(f"/user/{pseudo}")
+    if erreur:
+        return {"erreur": erreur}
+
+    serveur = (serveur or "mocha").strip().lower()
+    infos_serveur = (donnees.get("servers") or {}).get(serveur)
+    skin = donnees.get("skin") or {}
+
+    resultat = {
+        "pseudo": donnees.get("username"),
+        "date_creation_compte": donnees.get("created_at"),
+        "derniere_connexion_globale": donnees.get("last_connection"),
+        "skin_tete": skin.get("head"),
+        "skin_corps": skin.get("body"),
+        "serveur_consulte": serveur,
+    }
+    if not infos_serveur:
+        resultat["erreur_serveur"] = f"Aucune donnée pour ce joueur sur le serveur « {serveur} »."
+        return resultat
+
+    competences = infos_serveur.get("skills")
+    resultat.update({
+        "pays": infos_serveur.get("country") or None,
+        "rang_dans_le_pays": infos_serveur.get("country_rank") or None,
+        "grades": infos_serveur.get("groups") or [],
+        "power": infos_serveur.get("power"),
+        "max_power": infos_serveur.get("max_power"),
+        "temps_de_jeu_secondes": infos_serveur.get("playtime"),
+        "temps_de_jeu_lisible": _formater_duree_secondes(infos_serveur.get("playtime")),
+        "en_ligne": bool(infos_serveur.get("online")),
+        "derniere_connexion_sur_ce_serveur": infos_serveur.get("last_connection"),
+        "competences": competences if isinstance(competences, dict) else None,
+    })
+    return resultat
+
+
+ia_outils.enregistrer_outil(
+    nom="profil_joueur_nationsglory",
+    description=(
+        "Renvoie le profil complet d'un joueur NationsGlory : pseudo, date de "
+        "création du compte, dernière connexion, skin, ainsi que ses données "
+        "sur un serveur précis (pays, rang, power/max_power, temps de jeu, "
+        "statut en ligne, compétences comme mineur/bûcheron/fermier/etc.). À "
+        "utiliser dès qu'on demande le profil, les statistiques ou la fiche "
+        "d'un joueur NationsGlory. Sans argument de serveur, répond pour Mocha."
+    ),
+    parametres={
+        "type": "object",
+        "properties": {
+            "pseudo": {
+                "type": "string",
+                "description": "Pseudo exact du joueur NationsGlory à rechercher.",
+            },
+            "serveur": {
+                "type": "string",
+                "description": (
+                    "Nom du serveur NationsGlory en minuscules (ex: 'mocha', "
+                    "'blue', 'orange') dont on veut les statistiques en jeu. "
+                    "Par défaut : 'mocha'."
+                ),
+            },
+        },
+        "required": ["pseudo"],
+    },
+    executer=_outil_profil_joueur_nationsglory,
+)
+
+
+def _outil_pays_nationsglory(contexte, pays, serveur=None):
+    """Interroge GET /country/{server}/{country} sur l'API officielle
+    NationsGlory : nom, chef, membres, power/power max, mmr, niveau,
+    alliés et ennemis d'un pays, sur le serveur demandé (par défaut
+    "mocha"). `contexte` n'est pas utilisé ici (donnée publique, voir
+    _outil_profil_joueur_nationsglory ci-dessus)."""
+    pays = (pays or "").strip()
+    if not pays:
+        return {"erreur": "Aucun nom de pays fourni."}
+    serveur = (serveur or "mocha").strip().lower()
+    donnees, erreur = _requete_nationsglory(f"/country/{serveur}/{pays}")
+    if erreur:
+        return {"erreur": erreur}
+    return {
+        "nom": donnees.get("name"),
+        "serveur": donnees.get("server"),
+        "chef": donnees.get("leader"),
+        "date_creation": donnees.get("creation_date"),
+        "description": donnees.get("description"),
+        "nombre_membres": donnees.get("count_members"),
+        "membres": donnees.get("members") or [],
+        "power": donnees.get("power"),
+        "power_max": donnees.get("maxpower"),
+        "nombre_claims": donnees.get("count_claims"),
+        "mmr": donnees.get("mmr"),
+        "niveau": donnees.get("level"),
+        "allies": donnees.get("allies") or [],
+        "ennemis": donnees.get("ennemies") or [],
+    }
+
+
+ia_outils.enregistrer_outil(
+    nom="pays_nationsglory",
+    description=(
+        "Renvoie les informations d'un pays (nation) NationsGlory : nom, "
+        "chef, date de création, nombre et liste des membres, power/power "
+        "max, mmr, niveau, alliés et ennemis. À utiliser dès qu'on demande "
+        "des infos sur un pays/une nation NationsGlory. Sans argument de "
+        "serveur, répond pour Mocha."
+    ),
+    parametres={
+        "type": "object",
+        "properties": {
+            "pays": {
+                "type": "string",
+                "description": "Nom exact du pays NationsGlory à rechercher.",
+            },
+            "serveur": {
+                "type": "string",
+                "description": (
+                    "Nom du serveur NationsGlory en minuscules (ex: 'mocha', "
+                    "'blue', 'orange'). Par défaut : 'mocha'."
+                ),
+            },
+        },
+        "required": ["pays"],
+    },
+    executer=_outil_pays_nationsglory,
+)
+
+
+# ---- Outils "vraies données du royaume" (catalogue de missions, rang) ----
+# Contrairement aux outils "personnels" historiques (consulter_blames,
+# consulter_mission_active, consulter_historique_missions, gérés plus bas
+# dans _executer_outil_ia), ceux-ci passent par le registre générique
+# ia_outils.py. Le `contexte` reçu contient toujours guild_id/guild, et
+# DEPUIS PEU aussi joueur_id (voir interroger_ia) quand la conversation est
+# liée à un joueur précis — jamais fourni par l'IA elle-même, donc toujours
+# fiable pour ne renvoyer QUE les données du joueur qui parle.
+
+def _outil_catalogue_missions(contexte, categorie=None):
+    """Aperçu PUBLIC du catalogue de missions du serveur (aucune donnée
+    personnelle) : nombre de missions par catégorie, délai type, exemples."""
+    guild_id = contexte.get("guild_id")
+    if not guild_id:
+        return {"erreur": "Aucun serveur identifié pour cette conversation."}
+    structure = charger_missions_fichier(guild_id)
+    categorie = (categorie or "").strip().lower() or None
+    if categorie and categorie not in structure:
+        return {"erreur": f"Catégorie « {categorie} » inconnue (attendu : commune, moyenne, difficile, royal)."}
+    categories = [categorie] if categorie else list(structure.keys())
+    return {
+        "categories": {
+            cat: {
+                "nombre_missions": len(structure.get(cat, [])),
+                "delai_type": structure[cat][0]["delai"] if structure.get(cat) else None,
+                "exemples": [m["texte"] for m in structure.get(cat, [])[:3]],
+            }
+            for cat in categories
+        }
+    }
+
+
+ia_outils.enregistrer_outil(
+    nom="catalogue_missions",
+    description=(
+        "Renvoie un aperçu du catalogue de missions du serveur : nombre de "
+        "missions disponibles par catégorie (commune, moyenne, difficile, "
+        "royal), leur délai type et quelques exemples de missions. À "
+        "utiliser dès qu'on demande quelles missions existent, combien il y "
+        "en a, ou des exemples pour une catégorie donnée."
+    ),
+    parametres={
+        "type": "object",
+        "properties": {
+            "categorie": {
+                "type": "string",
+                "description": (
+                    "Catégorie précise à consulter : 'commune', 'moyenne', "
+                    "'difficile' ou 'royal'. Omis = toutes les catégories."
+                ),
+            }
+        },
+        "required": [],
+    },
+    executer=_outil_catalogue_missions,
+)
+
+
+def _outil_rang_joueur(contexte):
+    """Rang ACTUEL du joueur qui pose la question, plus le prochain rang
+    visable et l'état de ses conditions (auto-vérifiées + manuelles). Le
+    joueur est TOUJOURS celui de `contexte["joueur_id"]` (injecté par
+    interroger_ia), jamais un argument fourni par l'IA."""
+    guild_id = contexte.get("guild_id")
+    guild = contexte.get("guild")
+    joueur_id = contexte.get("joueur_id")
+    if not guild_id or not joueur_id:
+        return {"erreur": "Aucun joueur/serveur identifié pour cette conversation (ex: pas encore relié à un compte Discord)."}
+    rang_actuel = obtenir_rang_joueur(guild_id, joueur_id)
+    if not rang_actuel:
+        return {"erreur": "Aucun catalogue de rangs configuré sur ce serveur."}
+    resultat = {"rang_actuel": {"nom": rang_actuel["nom"], "groupe": rang_actuel["groupe"]}}
+    if guild:
+        rangs = sorted(charger_rangs(guild_id), key=lambda r: r["ordre"])
+        suivants = [r for r in rangs if r["ordre"] > rang_actuel["ordre"] and not r.get("unique")]
+        if suivants:
+            prochain = suivants[0]
+            rapport = verifier_conditions_rang(guild, joueur_id, prochain)
+            resultat["prochain_rang"] = {
+                "nom": prochain["nom"],
+                "conditions_automatiques": rapport["auto"],
+                "conditions_manuelles_a_verifier_par_un_instructeur": rapport["manuel"],
+                "toutes_les_conditions_automatiques_sont_ok": rapport["toutes_auto_ok"],
+            }
+        else:
+            resultat["prochain_rang"] = None
+    return resultat
+
+
+ia_outils.enregistrer_outil(
+    nom="rang_joueur",
+    description=(
+        "Renvoie le rang ACTUEL du joueur qui pose la question, ainsi que "
+        "le prochain rang visable et le détail de ses conditions (lesquelles "
+        "sont déjà remplies, lesquelles ne le sont pas encore, et lesquelles "
+        "doivent être vérifiées manuellement par un instructeur). À utiliser "
+        "dès qu'on demande son rang actuel, ce qu'il lui manque pour monter "
+        "de rang, ou s'il peut faire une demande de rang."
+    ),
+    parametres={"type": "object", "properties": {}, "required": []},
+    executer=_outil_rang_joueur,
+)
+
+
+def _outil_demandes_rang_en_attente(contexte):
+    """RÉSERVÉ AU STAFF : liste les demandes de rang encore en attente de
+    traitement sur ce serveur. Le joueur qui pose la question doit être
+    instructeur/propriétaire (vérifié via son rôle Discord réel, jamais
+    déclaré par l'IA elle-même) ; sinon l'outil refuse plutôt que d'exposer
+    les demandes des autres joueurs."""
+    guild_id = contexte.get("guild_id")
+    guild = contexte.get("guild")
+    joueur_id = contexte.get("joueur_id")
+    if not guild_id or not joueur_id:
+        return {"erreur": "Aucun joueur/serveur identifié pour cette conversation."}
+    membre = guild.get_member(int(joueur_id)) if guild and str(joueur_id).isdigit() else None
+    est_staff = verifier_permissions_staff(membre) if membre else est_proprietaire(joueur_id)
+    if not est_staff:
+        return {"erreur": "Cette information est réservée au staff (instructeurs/propriétaire)."}
+    demandes = [d for d in charger_demandes_rang(guild_id) if d.get("statut") == "en_attente"]
+    maintenant = datetime.now()
+    resultat = []
+    for d in demandes:
+        rang = obtenir_rang_par_id(guild_id, d.get("rang_id"))
+        try:
+            jours_attente = (maintenant - datetime.strptime(d["date"], "%d/%m/%Y à %H:%M")).days
+        except Exception:
+            jours_attente = None
+        resultat.append({
+            "joueur_id": d.get("joueur_id"),
+            "rang_demande": rang["nom"] if rang else d.get("rang_id"),
+            "date": d.get("date"),
+            "jours_attente": jours_attente,
+            "motivation": d.get("motivation"),
+        })
+    return {"nombre_en_attente": len(resultat), "demandes": resultat}
+
+
+ia_outils.enregistrer_outil(
+    nom="demandes_rang_en_attente",
+    description=(
+        "RÉSERVÉ AU STAFF (instructeur/propriétaire) : renvoie la liste des "
+        "demandes de rang actuellement en attente de traitement sur ce "
+        "serveur (joueur, rang demandé, date, motivation, jours d'attente). "
+        "À utiliser dès qu'un membre du staff demande quelles demandes de "
+        "rang sont en attente, à traiter, ou en retard. Refuse "
+        "automatiquement si celui qui pose la question n'est pas staff."
+    ),
+    parametres={"type": "object", "properties": {}, "required": []},
+    executer=_outil_demandes_rang_en_attente,
+)
+
+
+def _outil_statistiques_serveur(contexte):
+    """Statistiques PUBLIQUES et agrégées du serveur (aucune donnée
+    personnelle) : taux de réussite des missions, mission la plus/moins
+    populaire, temps moyen de complétion. Réutilise le même calcul que la
+    page /admin/statistiques du site, pour ne jamais afficher des chiffres
+    incohérents entre le site et l'IA."""
+    guild_id = contexte.get("guild_id")
+    if not guild_id:
+        return {"erreur": "Aucun serveur identifié pour cette conversation."}
+    stats = site_web.calculer_stats_missions(guild_id, {"charger_profils": charger_profils})
+    resultat = {
+        "total_missions_terminees": stats["total_missions"],
+        "total_reussies": stats["total_reussies"],
+        "total_echouees": stats["total_echouees"],
+        "taux_reussite_pourcent": stats["taux_reussite"],
+        "temps_moyen_completion": stats["temps_moyen_texte"],
+        "nombre_missions_distinctes_jouees": stats["nb_missions_distinctes"],
+    }
+    if stats["mission_plus_populaire"]:
+        nom, info = stats["mission_plus_populaire"]
+        resultat["mission_plus_populaire"] = {"texte": nom, "categorie": info["categorie"], "fois_attribuee": info["count"]}
+    if stats["mission_moins_populaire"]:
+        nom, info = stats["mission_moins_populaire"]
+        resultat["mission_moins_populaire"] = {"texte": nom, "categorie": info["categorie"], "fois_attribuee": info["count"]}
+    return resultat
+
+
+ia_outils.enregistrer_outil(
+    nom="statistiques_serveur",
+    description=(
+        "Renvoie les statistiques agrégées et publiques du serveur : taux "
+        "de réussite des missions, mission la plus/moins populaire, temps "
+        "moyen de complétion. À utiliser dès qu'on demande des statistiques "
+        "générales du royaume (pas les stats personnelles d'un joueur, "
+        "voir consulter_historique_missions pour ça)."
+    ),
+    parametres={"type": "object", "properties": {}, "required": []},
+    executer=_outil_statistiques_serveur,
+)
+
 VALERIUS_IA_SYSTEM_PROMPT = (
     "Tu es l'Intelligence Royale de Valerius, un conseiller virtuel au service d'un "
     "Royaume géré sur Discord. Tu réponds aux joueurs et au staff avec courtoisie, "
     "clarté et un ton légèrement noble/royal, sans exagérer. Tu peux aider sur "
     "n'importe quel sujet (questions générales, aide sur le serveur, conseils, etc.). "
     "Reste concis : tes réponses doivent tenir dans un message Discord (évite les "
-    "réponses interminables sauf si on te le demande explicitement)."
+    "réponses interminables sauf si on te le demande explicitement). "
+    "Tu as accès à des outils pour consulter les VRAIES données du joueur qui te "
+    "parle (ses blâmes actifs, sa mission en cours, son historique de missions). "
+    "Utilise-les systématiquement dès que la question porte sur SES données "
+    "personnelles plutôt que de deviner ou d'inventer un chiffre. Si aucun outil "
+    "n'est disponible pour cette conversation (ex: compte non relié à Discord), "
+    "dis-le simplement et oriente vers la commande Discord correspondante."
 )
 
 # Contexte général du "pays" / royaume, pour que l'IA sache toujours répondre
@@ -166,22 +648,184 @@ def reinitialiser_historique_ia_cle(cle):
     l'historique d'une clé quelconque, sans passer par une interaction Discord."""
     _ia_historique.pop(cle, None)
 
-async def interroger_ia(cle, question: str):
+# ---------- Outils (function calling) : accès en LECTURE SEULE aux vraies
+# données du joueur qui pose la question (jamais celles d'un autre — les
+# outils ignorent complètement tout identifiant que le modèle pourrait
+# inventer et utilisent toujours guild_id/joueur_id fournis par le code
+# appelant, jamais par l'IA elle-même). ----------
+
+def _outils_ia_disponibles():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "consulter_blames",
+                "description": (
+                    "Renvoie le nombre de blâmes ACTIFS (non expirés) du joueur qui "
+                    "pose la question, avec leur raison et leur date. À utiliser dès "
+                    "qu'on demande combien de blâmes/avertissements on a, ou de voir "
+                    "son casier disciplinaire."
+                ),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consulter_mission_active",
+                "description": (
+                    "Renvoie la mission actuellement en cours du joueur qui pose la "
+                    "question (texte, catégorie, temps restant), ou indique qu'il n'a "
+                    "aucune mission active. À utiliser dès qu'on demande sa mission "
+                    "en cours, son temps restant, ou l'état de son ticket."
+                ),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consulter_historique_missions",
+                "description": (
+                    "Renvoie le bilan (nombre de missions réussies/échouées) et les "
+                    "dernières missions de l'historique du joueur qui pose la "
+                    "question. À utiliser dès qu'on demande son nombre de missions "
+                    "réussies/échouées ou son historique."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limite": {
+                            "type": "integer",
+                            "description": "Nombre de missions récentes à renvoyer (par défaut 5, max 15).",
+                        }
+                    },
+                    "required": [],
+                },
+            },
+        },
+    ] + ia_outils.definitions_pour_ia()
+
+# Noms des outils "historiques" (données PERSONNELLES du joueur qui parle) :
+# gérés par _executer_outil_ia ci-dessous, avec guild_id/joueur_id imposés
+# par le code plutôt que par l'IA. Tout le reste (ex: données publiques
+# NationsGlory) passe par le registre générique ia_outils.py.
+NOMS_OUTILS_PERSONNELS = {"consulter_blames", "consulter_mission_active", "consulter_historique_missions"}
+
+def _executer_outil_ia(nom, arguments, guild_id, joueur_id):
+    """Exécute un outil demandé par l'IA. `guild_id`/`joueur_id` viennent
+    TOUJOURS du code appelant (interaction Discord ou compte site connecté),
+    jamais des arguments générés par le modèle : impossible pour l'IA de
+    consulter les données d'un autre joueur que celui qui lui parle."""
+    if not guild_id or not joueur_id:
+        return {"erreur": "Aucun joueur/serveur identifié pour cette conversation (ex: pas encore relié à un compte Discord)."}
+    try:
+        if nom == "consulter_blames":
+            actifs = obtenir_blames_actifs(guild_id, joueur_id)
+            return {
+                "nombre_blames_actifs": len(actifs),
+                "blames": [{"raison": b.get("raison"), "date": b.get("date")} for b in actifs],
+            }
+        if nom == "consulter_mission_active":
+            m = missions_actives.get(guild_id, {}).get(joueur_id)
+            if not m:
+                return {"mission_active": None}
+            restant = m["date_fin"] - datetime.now()
+            return {
+                "mission_active": {
+                    "texte": m["texte"],
+                    "categorie": m["cat"],
+                    "temps_restant": formater_duree(restant) if restant.total_seconds() > 0 else "délai dépassé (en attente de traitement)",
+                    "en_attente_validation": m.get("en_attente", False),
+                }
+            }
+        if nom == "consulter_historique_missions":
+            limite = arguments.get("limite") or 5
+            try:
+                limite = max(1, min(int(limite), 15))
+            except (TypeError, ValueError):
+                limite = 5
+            profils = charger_profils(guild_id)
+            profil = profils.get(str(joueur_id))
+            if not profil:
+                return {"total_reussies": 0, "total_echouees": 0, "dernieres_missions": []}
+            return {
+                "total_reussies": profil.get("total_reussies", 0),
+                "total_echouees": profil.get("total_echouees", 0),
+                "dernieres_missions": [
+                    {"texte": h.get("texte"), "statut": h.get("statut"), "categorie": h.get("categorie"), "date": h.get("date")}
+                    for h in profil.get("historique", [])[:limite]
+                ],
+            }
+        return {"erreur": f"Outil inconnu : {nom}"}
+    except Exception as e:
+        return {"erreur": f"Erreur interne lors de la consultation : {e}"}
+
+IA_MAX_ALLERS_RETOURS_OUTILS = 3  # limite de sécurité anti-boucle infinie
+
+async def interroger_ia(cle, question: str, guild_id=None, joueur_id=None):
     """Envoie la question (+ historique récent lié à `cle`) à l'IA (Groq).
     Retourne (texte, erreur). `cle` identifie la conversation : peut venir
     de _cle_ia(interaction) côté Discord, ou d'une clé propre au site web
-    (ex: ("site", login)), pour que chacun garde son propre historique."""
+    (ex: ("site", login)), pour que chacun garde son propre historique.
+    Si `guild_id`/`joueur_id` sont fournis, l'IA peut consulter les VRAIES
+    données de CE joueur (blâmes, mission active, historique) via des
+    outils — jamais celles d'un autre joueur. Les outils publics/génériques
+    enregistrés via ia_outils.py (ex: joueurs en ligne NationsGlory) restent
+    disponibles même sans joueur_id, puisqu'ils ne dépendent d'aucun joueur."""
     if not client_ia:
         return None, "❌ L'Intelligence Royale n'est pas configurée : aucune clé API Groq (variable `GROQ_API_KEY`) n'a été définie."
     historique = _ia_historique.get(cle, [])
     messages = [{"role": "system", "content": obtenir_prompt_systeme_ia()}] + historique + [{"role": "user", "content": question}]
+    outils = _outils_ia_disponibles()
+    # joueur_id est inclus ici (en plus de guild_id/guild) pour que des
+    # outils génériques enregistrés via ia_outils.py (ex: rang_joueur)
+    # puissent eux aussi accéder aux VRAIES données du joueur qui parle,
+    # sans jamais le recevoir comme argument fourni par l'IA elle-même.
+    contexte_outils = {
+        "guild_id": guild_id,
+        "guild": discord.utils.get(bot.guilds, id=guild_id) if guild_id else None,
+        "joueur_id": joueur_id,
+    }
     try:
-        reponse = await client_ia.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=IA_MAX_TOKENS,
-            messages=messages,
-        )
-        texte = (reponse.choices[0].message.content or "").strip()
+        texte = None
+        for _ in range(IA_MAX_ALLERS_RETOURS_OUTILS):
+            kwargs = dict(model=GROQ_MODEL, max_tokens=IA_MAX_TOKENS, messages=messages)
+            if outils:
+                kwargs["tools"] = outils
+                kwargs["tool_choice"] = "auto"
+            reponse = await client_ia.chat.completions.create(**kwargs)
+            message = reponse.choices[0].message
+            appels = getattr(message, "tool_calls", None)
+            if not appels:
+                texte = (message.content or "").strip()
+                break
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {"id": a.id, "type": "function", "function": {"name": a.function.name, "arguments": a.function.arguments}}
+                    for a in appels
+                ],
+            })
+            for a in appels:
+                nom_outil = a.function.name
+                arguments_brutes = a.function.arguments or "{}"
+                if nom_outil in NOMS_OUTILS_PERSONNELS:
+                    if not guild_id or not joueur_id:
+                        resultat = {"erreur": "Aucun joueur/serveur identifié pour cette conversation (ex: pas encore relié à un compte Discord)."}
+                    else:
+                        try:
+                            arguments = json.loads(arguments_brutes)
+                        except Exception:
+                            arguments = {}
+                        resultat = _executer_outil_ia(nom_outil, arguments, guild_id, joueur_id)
+                    contenu = json.dumps(resultat, ensure_ascii=False)
+                else:
+                    contenu = await ia_outils.executer_outil(nom_outil, contexte_outils, arguments_brutes)
+                messages.append({"role": "tool", "tool_call_id": a.id, "content": contenu})
+        if texte is None:
+            texte = "🤖 *(je n'ai pas réussi à obtenir une réponse claire, réessaie ta question)*"
         if not texte:
             return "🤖 *(l'IA n'a renvoyé aucun texte, réessaie ta question)*", None
         historique = historique + [{"role": "user", "content": question}, {"role": "assistant", "content": texte}]
@@ -214,6 +858,43 @@ def get_profiles_file(guild_id):
 def get_active_missions_file(guild_id):
     return f"valerius_missions_actives_{guild_id}.json"
 
+def get_points_file(guild_id):
+    return f"valerius_points_{guild_id}.json"
+
+# ================= POINTS PAR CATÉGORIE (entièrement configurables) =================
+# Chaque mission ne rapporte PAS un nombre de points qui lui est propre :
+# c'est sa CATÉGORIE (commune/moyenne/difficile/royal) qui détermine
+# combien de points elle rapporte, et toutes les missions d'une même
+# catégorie rapportent donc exactement le même nombre de points. Ces
+# valeurs par défaut ne servent que tant que rien n'a été configuré ; elles
+# sont modifiables à tout moment via /points_config ou le site web
+# (page "Catalogue de missions"), serveur par serveur.
+POINTS_PAR_DEFAUT_CATEGORIE = {"commune": 10, "moyenne": 25, "difficile": 50, "royal": 100}
+
+def charger_points_categories(guild_id):
+    """Charge la config des points par catégorie pour ce serveur. Complète
+    automatiquement avec les valeurs par défaut si une catégorie manque
+    encore (ex: fichier pas encore créé, ou nouvelle catégorie ajoutée)."""
+    fichier = get_points_file(guild_id)
+    points = dict(POINTS_PAR_DEFAUT_CATEGORIE)
+    if os.path.exists(fichier):
+        try:
+            with open(fichier, "r", encoding="utf-8") as f:
+                points.update(json.load(f))
+        except Exception:
+            pass
+    return points
+
+def sauvegarder_points_categories(guild_id, points):
+    fichier = get_points_file(guild_id)
+    with open(fichier, "w", encoding="utf-8") as f:
+        json.dump(points, f, indent=4, ensure_ascii=False)
+
+def points_pour_categorie(guild_id, categorie):
+    """Nombre de points que rapporte N'IMPORTE QUELLE mission de cette
+    catégorie sur ce serveur (0 si la catégorie est inconnue)."""
+    return charger_points_categories(guild_id).get(categorie, 0)
+
 def charger_missions_fichier(guild_id):
     structure = {"commune": [], "moyenne": [], "difficile": [], "royal": []}
     file_name = get_file_name(guild_id)
@@ -222,33 +903,449 @@ def charger_missions_fichier(guild_id):
         for line in f:
             line = line.strip()
             if not line or "|" not in line: continue
-            parts = line.split("|", 2)
-            if len(parts) != 3: continue
-            cat, texte, delai = parts
-            if cat in structure: structure[cat].append({"texte": texte, "delai": delai})
+            # 4e champ optionnel = points spécifiques à CETTE mission (surcharge
+            # le nombre de points de la catégorie). Absent/vide = utilise les
+            # points de la catégorie. Rétro-compatible avec les anciennes
+            # lignes à 3 champs (sans points).
+            parts = line.split("|", 3)
+            if len(parts) not in (3, 4): continue
+            cat, texte, delai = parts[0], parts[1], parts[2]
+            points_str = parts[3] if len(parts) == 4 else ""
+            mission = {"texte": texte, "delai": delai}
+            if points_str.strip().lstrip("-").isdigit():
+                mission["points"] = int(points_str.strip())
+            if cat in structure: structure[cat].append(mission)
     return structure
 
 def reecrire_toutes_missions(guild_id, structure):
     file_name = get_file_name(guild_id)
     with open(file_name, "w", encoding="utf-8") as f:
         for cat, liste in structure.items():
-            for m in liste: f.write(f"{cat}|{m['texte']}|{m['delai']}\n")
+            for m in liste:
+                points_str = str(m["points"]) if m.get("points") is not None else ""
+                f.write(f"{cat}|{m['texte']}|{m['delai']}|{points_str}\n")
 
-def sauvegarder_mission_fichier(guild_id, categorie, texte, delai):
+def sauvegarder_mission_fichier(guild_id, categorie, texte, delai, points=None):
     file_name = get_file_name(guild_id)
-    with open(file_name, "a", encoding="utf-8") as f: f.write(f"{categorie}|{texte}|{delai}\n")
+    points_str = str(points) if points is not None else ""
+    with open(file_name, "a", encoding="utf-8") as f: f.write(f"{categorie}|{texte}|{delai}|{points_str}\n")
 
 def vider_toutes_missions(guild_id):
     file_name = get_file_name(guild_id)
     with open(file_name, "w", encoding="utf-8") as f:
         f.write("")
 
+def definir_points_mission(guild_id, categorie, index, points):
+    """Modifie (ou efface, si `points` est None) la surcharge de points
+    d'UNE mission précise du catalogue, repérée par catégorie + position.
+    Sans surcharge, la mission retombe sur les points de sa catégorie."""
+    structure = charger_missions_fichier(guild_id)
+    if categorie not in structure or not (0 <= index < len(structure[categorie])):
+        return False
+    if points is None:
+        structure[categorie][index].pop("points", None)
+    else:
+        structure[categorie][index]["points"] = points
+    reecrire_toutes_missions(guild_id, structure)
+    return True
+
+# ================= BOUTIQUE (achat de produits contre des points) =================
+# Chaque serveur a son propre catalogue de produits, stocké dans un fichier
+# JSON séparé (comme les missions et les points par catégorie). Un produit a
+# un nom, un coût en points, une description optionnelle, une image
+# (fichier uploadé OU URL externe) et un stock optionnel (None = illimité).
+# L'achat lui-même déduit les points du profil du joueur et garde une trace
+# dans son historique d'achats — il ne livre RIEN automatiquement (pas de
+# rôle Discord donné, pas d'objet en jeu) : c'est un instructeur qui doit
+# ensuite remettre la récompense manuellement, d'où le message affiché au
+# joueur après achat.
+
+def get_boutique_file(guild_id):
+    return f"valerius_boutique_{guild_id}.json"
+
+def charger_boutique(guild_id):
+    fichier = get_boutique_file(guild_id)
+    if not os.path.exists(fichier):
+        return []
+    try:
+        with open(fichier, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def sauvegarder_boutique(guild_id, produits):
+    fichier = get_boutique_file(guild_id)
+    with open(fichier, "w", encoding="utf-8") as f:
+        json.dump(produits, f, indent=4, ensure_ascii=False)
+
+def obtenir_produit_boutique(guild_id, produit_id):
+    for p in charger_boutique(guild_id):
+        if p["id"] == produit_id:
+            return p
+    return None
+
+def ajouter_produit_boutique(guild_id, nom, cout, description="", image=None, image_url=None, stock=None):
+    """Ajoute un produit au catalogue de ce serveur.
+    - image : nom de fichier uploadé (stocké dans boutique_images/), ou None.
+    - image_url : URL externe utilisée si aucun fichier n'a été uploadé.
+    - stock : nombre d'unités disponibles, ou None pour illimité."""
+    produits = charger_boutique(guild_id)
+    produit = {
+        "id": secrets.token_hex(8),
+        "nom": nom,
+        "description": description or "",
+        "cout": cout,
+        "image": image,
+        "image_url": image_url,
+        "stock": stock,
+        "actif": True,
+    }
+    produits.append(produit)
+    sauvegarder_boutique(guild_id, produits)
+    return produit
+
+def modifier_produit_boutique(guild_id, produit_id, **champs):
+    produits = charger_boutique(guild_id)
+    for p in produits:
+        if p["id"] == produit_id:
+            p.update(champs)
+            sauvegarder_boutique(guild_id, produits)
+            return p
+    return None
+
+def supprimer_produit_boutique(guild_id, produit_id):
+    produits = charger_boutique(guild_id)
+    nouveaux = [p for p in produits if p["id"] != produit_id]
+    if len(nouveaux) == len(produits):
+        return False
+    sauvegarder_boutique(guild_id, nouveaux)
+    return True
+
+def acheter_produit_boutique(guild_id, joueur_id, produit_id):
+    """Tente l'achat d'un produit par un joueur. Vérifie disponibilité,
+    stock et solde de points AVANT de rien débiter. Renvoie toujours
+    (succes: bool, message: str, produit: dict|None) — jamais d'exception,
+    pour que le site puisse afficher un message clair dans tous les cas."""
+    produit = obtenir_produit_boutique(guild_id, produit_id)
+    if not produit or not produit.get("actif", True):
+        return False, "Ce produit n'est plus disponible.", None
+    if produit.get("stock") is not None and produit["stock"] <= 0:
+        return False, "Ce produit est en rupture de stock.", None
+
+    profils = charger_profils(guild_id)
+    initialiser_profil(joueur_id, profils)
+    s_id = str(joueur_id)
+    solde = profils[s_id].get("total_points", 0)
+    cout = produit.get("cout", 0)
+    if solde < cout:
+        return False, f"Points insuffisants ({solde}/{cout} pts).", None
+
+    profils[s_id]["total_points"] = solde - cout
+    profils[s_id].setdefault("achats", []).insert(0, {
+        "produit_id": produit["id"],
+        "nom": produit["nom"],
+        "cout": cout,
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+    })
+    sauvegarder_profils(guild_id, profils)
+
+    if produit.get("stock") is not None:
+        modifier_produit_boutique(guild_id, produit_id, stock=produit["stock"] - 1)
+
+    return True, f"Achat de « {produit['nom']} » réussi pour {cout} pts !", produit
+
+
+# ================= ROUE ALÉATOIRE (roue de la fortune configurable) =================
+# Il existe maintenant TROIS roues indépendantes par serveur — une par
+# catégorie de mission "à partir de moyenne" : "moyenne", "difficile" et
+# "royal" (pas de roue "commune"). Chacune a son propre fichier JSON, sa
+# propre liste de parts et son propre rééquilibrage automatique — elles ne
+# partagent RIEN entre elles. Une part a un nom, un pourcentage de chances,
+# un nombre de points optionnel donné au joueur qui tombe dessus (0 = pas de
+# récompense), une image optionnelle (URL), et un statut actif/inactif.
+#
+# INVARIANT respecté à tout moment, pour CHAQUE roue séparément : la somme
+# des pourcentages des parts ACTIVES vaut toujours 100 (aux arrondis près).
+# C'est ce qui permet le rééquilibrage automatique demandé : dès qu'un admin
+# fixe le pourcentage d'UNE part (en l'ajoutant, la modifiant, l'activant ou
+# la désactivant), toutes les AUTRES parts actives DE CETTE ROUE sont
+# automatiquement redimensionnées proportionnellement à leur poids actuel
+# pour que le total retombe pile sur 100 — jamais besoin de retoucher les
+# autres à la main.
+#
+# Pour jouer, un joueur doit dépenser un "ticket de roue" (voir plus bas,
+# section TICKETS DE ROUE) : un ticket est générique, il permet d'activer
+# N'IMPORTE LAQUELLE des trois roues au choix du joueur — il n'est PAS lié à
+# la catégorie de mission qui l'a fait gagner.
+
+TYPES_ROUE = ("moyenne", "difficile", "royal")
+NOMS_TYPES_ROUE = {"moyenne": "🔵 Roue Moyenne", "difficile": "🟠 Roue Difficile", "royal": "🔴 Roue Royale"}
+
+def _valider_type_roue(type_roue):
+    if type_roue not in TYPES_ROUE:
+        raise ValueError(f"Type de roue invalide : « {type_roue} » (attendu : {', '.join(TYPES_ROUE)}).")
+
+def get_roue_file(guild_id, type_roue):
+    _valider_type_roue(type_roue)
+    return f"valerius_roue_{type_roue}_{guild_id}.json"
+
+def charger_roue(guild_id, type_roue):
+    fichier = get_roue_file(guild_id, type_roue)
+    if not os.path.exists(fichier):
+        return []
+    try:
+        with open(fichier, "r", encoding="utf-8") as f:
+            parts = json.load(f)
+    except Exception:
+        return []
+    # Compatibilité : les parts créées avant l'ajout du champ image.
+    for p in parts:
+        p.setdefault("image", "")
+    return parts
+
+def sauvegarder_roue(guild_id, type_roue, parts):
+    fichier = get_roue_file(guild_id, type_roue)
+    with open(fichier, "w", encoding="utf-8") as f:
+        json.dump(parts, f, indent=4, ensure_ascii=False)
+
+def obtenir_part_roue(guild_id, type_roue, part_id):
+    for p in charger_roue(guild_id, type_roue):
+        if p["id"] == part_id:
+            return p
+    return None
+
+def _corriger_arrondi_roue(parts):
+    """Corrige les micro-écarts d'arrondi (ex: 33.33 + 33.33 + 33.34 ≠ 100
+    pile) pour que la somme des parts actives retombe EXACTEMENT sur 100.0,
+    en ajustant la plus grande part active. Modifie `parts` sur place."""
+    actives = [p for p in parts if p.get("actif", True)]
+    if not actives:
+        return
+    total = round(sum(p["pourcentage"] for p in actives), 2)
+    ecart = round(100 - total, 2)
+    if ecart:
+        plus_grande = max(actives, key=lambda p: p["pourcentage"])
+        plus_grande["pourcentage"] = round(plus_grande["pourcentage"] + ecart, 2)
+
+def _fixer_pourcentage_part_roue(parts, part_id, nouveau_pourcentage):
+    """Fixe le pourcentage de la part `part_id` à `nouveau_pourcentage` et
+    redimensionne PROPORTIONNELLEMENT toutes les AUTRES parts actives (à
+    leur poids relatif actuel entre elles) pour que le total des parts
+    actives reste exactement 100. Fonctionne aussi bien pour une part qu'on
+    vient d'ajouter (à 0% pour l'instant) que pour une part existante qu'on
+    modifie. Modifie `parts` sur place, ne renvoie rien."""
+    nouveau_pourcentage = max(0.0, min(100.0, round(float(nouveau_pourcentage), 2)))
+    autres_actives = [p for p in parts if p.get("actif", True) and p["id"] != part_id]
+    reste = round(100 - nouveau_pourcentage, 2)
+
+    if autres_actives:
+        total_autres = sum(p["pourcentage"] for p in autres_actives)
+        if total_autres > 0:
+            for p in autres_actives:
+                p["pourcentage"] = round(p["pourcentage"] / total_autres * reste, 2)
+        else:
+            part_egale = round(reste / len(autres_actives), 2)
+            for p in autres_actives:
+                p["pourcentage"] = part_egale
+
+    for p in parts:
+        if p["id"] == part_id:
+            p["pourcentage"] = nouveau_pourcentage
+            p["actif"] = True
+
+    _corriger_arrondi_roue(parts)
+
+def _repartir_apres_retrait_roue(parts, part_id_exclue):
+    """Redimensionne toutes les parts actives restantes (en excluant
+    `part_id_exclue`, qui vient d'être supprimée ou désactivée) pour que
+    leur total remonte à 100, proportionnellement à leur poids actuel entre
+    elles. Modifie `parts` sur place."""
+    actives_restantes = [p for p in parts if p.get("actif", True) and p["id"] != part_id_exclue]
+    if not actives_restantes:
+        return
+    total = sum(p["pourcentage"] for p in actives_restantes)
+    if total > 0:
+        for p in actives_restantes:
+            p["pourcentage"] = round(p["pourcentage"] / total * 100, 2)
+    else:
+        part_egale = round(100 / len(actives_restantes), 2)
+        for p in actives_restantes:
+            p["pourcentage"] = part_egale
+    _corriger_arrondi_roue(parts)
+
+def ajouter_part_roue(guild_id, type_roue, nom, pourcentage=None, points=0, image=""):
+    """Ajoute une nouvelle part à LA roue `type_roue` de ce serveur. Si
+    `pourcentage` n'est pas précisé, la nouvelle part reçoit une part égale
+    (100 / nombre de parts actives après ajout), et TOUTES les autres parts
+    actives DE CETTE ROUE sont automatiquement réduites en proportion pour
+    lui faire de la place."""
+    parts = charger_roue(guild_id, type_roue)
+    nb_actives_apres = len([p for p in parts if p.get("actif", True)]) + 1
+    if pourcentage is None:
+        pourcentage = 100 / nb_actives_apres
+
+    nouvelle_part = {
+        "id": secrets.token_hex(8),
+        "nom": nom,
+        "pourcentage": 0.0,
+        "points": points or 0,
+        "image": image or "",
+        "actif": True,
+    }
+    parts.append(nouvelle_part)
+    _fixer_pourcentage_part_roue(parts, nouvelle_part["id"], pourcentage)
+    sauvegarder_roue(guild_id, type_roue, parts)
+    return next(p for p in parts if p["id"] == nouvelle_part["id"])
+
+def modifier_part_roue(guild_id, type_roue, part_id, nom=None, pourcentage=None, points=None, image=None):
+    """Modifie une part existante de la roue `type_roue`. Si `pourcentage`
+    est fourni, TOUTES les autres parts actives DE CETTE ROUE se
+    rééquilibrent automatiquement (voir _fixer_pourcentage_part_roue) ;
+    `nom`/`points`/`image` se modifient sans impact sur les pourcentages des
+    autres parts. Renvoie la part mise à jour, ou None si elle n'existe pas."""
+    parts = charger_roue(guild_id, type_roue)
+    part = next((p for p in parts if p["id"] == part_id), None)
+    if not part:
+        return None
+    if pourcentage is not None:
+        part["actif"] = True  # on ne peut fixer un % précis que sur une part active
+        _fixer_pourcentage_part_roue(parts, part_id, pourcentage)
+    if nom is not None:
+        part["nom"] = nom
+    if points is not None:
+        part["points"] = points
+    if image is not None:
+        part["image"] = image
+    sauvegarder_roue(guild_id, type_roue, parts)
+    return next(p for p in parts if p["id"] == part_id)
+
+def basculer_actif_part_roue(guild_id, type_roue, part_id):
+    """Active/désactive une part de la roue `type_roue` sans la supprimer :
+    - désactivation : son pourcentage est libéré et redistribué
+      proportionnellement aux autres parts actives (total ramené à 100) ;
+    - réactivation : elle récupère une part égale entre toutes les parts
+      actives, et les autres se réduisent automatiquement en proportion.
+    Renvoie la part mise à jour, ou None si elle n'existe pas."""
+    parts = charger_roue(guild_id, type_roue)
+    part = next((p for p in parts if p["id"] == part_id), None)
+    if not part:
+        return None
+    if part.get("actif", True):
+        part["actif"] = False
+        _repartir_apres_retrait_roue(parts, part_id)
+    else:
+        nb_actives_apres = len([p for p in parts if p.get("actif", True)]) + 1
+        _fixer_pourcentage_part_roue(parts, part_id, 100 / nb_actives_apres)
+    sauvegarder_roue(guild_id, type_roue, parts)
+    return next(p for p in parts if p["id"] == part_id)
+
+def supprimer_part_roue(guild_id, type_roue, part_id):
+    """Supprime définitivement une part de la roue `type_roue` et redistribue
+    son pourcentage (si elle était active) proportionnellement aux parts
+    actives restantes, pour que leur total reste 100. Renvoie False si la
+    part n'existe pas."""
+    parts = charger_roue(guild_id, type_roue)
+    part = next((p for p in parts if p["id"] == part_id), None)
+    if not part:
+        return False
+    etait_active = part.get("actif", True)
+    nouveaux = [p for p in parts if p["id"] != part_id]
+    if etait_active:
+        _repartir_apres_retrait_roue(nouveaux, part_id)
+    sauvegarder_roue(guild_id, type_roue, nouveaux)
+    return True
+
+def tourner_roue(guild_id, type_roue):
+    """Tire une part au hasard sur la roue `type_roue`, pondérée par son
+    pourcentage. Renvoie None s'il n'y a aucune part active avec un
+    pourcentage > 0."""
+    actives = [p for p in charger_roue(guild_id, type_roue) if p.get("actif", True) and p["pourcentage"] > 0]
+    if not actives:
+        return None
+    return random.choices(actives, weights=[p["pourcentage"] for p in actives], k=1)[0]
+
+def jouer_roue(guild_id, type_roue, joueur_id):
+    """Consomme un ticket de roue du joueur (voir TICKETS DE ROUE ci-dessous),
+    tire une part sur la roue `type_roue` choisie et, si elle offre des
+    points, les crédite immédiatement sur le profil du joueur.
+
+    Renvoie un tuple (gagnante, erreur) :
+    - en cas de succès : (part_gagnante_dict, None) ;
+    - en cas d'échec (pas de ticket, roue vide, type invalide) :
+      (None, "message d'erreur lisible par le joueur"). Si le ticket avait
+      déjà été consommé au moment où on découvre que la roue est vide, il
+      est automatiquement remboursé.
+
+    Utilisée par le site web (page /roue) : encapsule vérification du
+    ticket + tirage + récompense en une seule opération, pour que le site
+    n'ait jamais à manipuler les profils/tickets lui-même."""
+    try:
+        _valider_type_roue(type_roue)
+    except ValueError:
+        return None, "Cette roue n'existe pas."
+
+    if not retirer_ticket_roue(guild_id, joueur_id):
+        return None, "Tu n'as aucun ticket de roue. Termine une mission moyenne, difficile ou royale pour en gagner un."
+
+    gagnante = tourner_roue(guild_id, type_roue)
+    if not gagnante:
+        ajouter_tickets_roue(guild_id, joueur_id, 1)  # roue vide : on rembourse le ticket
+        return None, "Cette roue n'a aucune part active pour l'instant."
+
+    if gagnante.get("points"):
+        profils = charger_profils(guild_id)
+        initialiser_profil(joueur_id, profils)
+        s_id = str(joueur_id)
+        profils[s_id]["total_points"] = profils[s_id].get("total_points", 0) + gagnante["points"]
+        sauvegarder_profils(guild_id, profils)
+    return gagnante, None
+
+
+# ================= TICKETS DE ROUE =================
+# Un ticket de roue est générique (pas lié à une catégorie précise) : il est
+# stocké directement dans le profil du joueur (profils[id]["tickets_roue"],
+# un simple compteur entier) et permet d'activer LA ROUE DE SON CHOIX parmi
+# les trois (moyenne / difficile / royal). Deux façons d'en obtenir :
+# - automatiquement, à la validation d'une mission moyenne/difficile/royale
+#   (voir action_accepter_mission) ;
+# - manuellement, un instructeur/propriétaire peut en offrir depuis la fiche
+#   du joueur sur le site web (/admin/profils/<guild_id>/<joueur_id>).
+
+def obtenir_tickets_roue(guild_id, joueur_id):
+    profils = charger_profils(guild_id)
+    return profils.get(str(joueur_id), {}).get("tickets_roue", 0)
+
+def ajouter_tickets_roue(guild_id, joueur_id, quantite):
+    """Ajoute (ou retire, si `quantite` est négatif) des tickets de roue au
+    profil du joueur, sans jamais descendre sous 0. Renvoie le nouveau
+    total."""
+    profils = charger_profils(guild_id)
+    initialiser_profil(joueur_id, profils)
+    s_id = str(joueur_id)
+    profils[s_id]["tickets_roue"] = max(0, profils[s_id].get("tickets_roue", 0) + quantite)
+    sauvegarder_profils(guild_id, profils)
+    return profils[s_id]["tickets_roue"]
+
+def retirer_ticket_roue(guild_id, joueur_id):
+    """Consomme UN ticket de roue si le joueur en a au moins un. Renvoie
+    True si un ticket a bien été consommé, False s'il n'en avait aucun
+    (dans ce cas, rien n'est modifié)."""
+    profils = charger_profils(guild_id)
+    initialiser_profil(joueur_id, profils)
+    s_id = str(joueur_id)
+    if profils[s_id].get("tickets_roue", 0) <= 0:
+        return False
+    profils[s_id]["tickets_roue"] -= 1
+    sauvegarder_profils(guild_id, profils)
+    return True
+
+
 def charger_profils(guild_id):
     profiles_file = get_profiles_file(guild_id)
     if not os.path.exists(profiles_file): return {}
     try:
         with open(profiles_file, "r", encoding="utf-8") as f: return json.load(f)
-    except: return {}
+    except Exception: return {}
 
 def sauvegarder_profils(guild_id, profils):
     profiles_file = get_profiles_file(guild_id)
@@ -260,10 +1357,17 @@ def initialiser_profil(p_id, profils):
         profils[s_id] = {
             "total_reussies": 0,
             "total_echouees": 0,
+            "total_points": 0,
+            "tickets_roue": 0,
             "historique": []
         }
+    else:
+        # Compatibilité : les profils créés avant l'ajout du système de
+        # points / tickets de roue n'ont pas encore ces champs.
+        profils[s_id].setdefault("total_points", 0)
+        profils[s_id].setdefault("tickets_roue", 0)
 
-def ajouter_historique(p_id, profils, texte, statut, cat="inconnu", duree_secondes=None):
+def ajouter_historique(p_id, profils, texte, statut, cat="inconnu", duree_secondes=None, points=0):
     s_id = str(p_id)
     initialiser_profil(p_id, profils)
     profils[s_id]["historique"].insert(0, {
@@ -271,7 +1375,11 @@ def ajouter_historique(p_id, profils, texte, statut, cat="inconnu", duree_second
         "statut": statut,
         "categorie": cat,
         "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
-        "duree_secondes": duree_secondes
+        "duree_secondes": duree_secondes,
+        # Points réellement gagnés sur CETTE entrée (figés au moment de la
+        # validation) : permet de les retirer correctement plus tard même
+        # si la config des points par catégorie a changé entre-temps.
+        "points": points
     })
 
 DELAI_MIN_REPETITION_MISSION = timedelta(days=7)
@@ -310,10 +1418,10 @@ def choisir_mission_sans_repetition(guild_id, joueur_id, missions_liste, delai=D
 # ticket lui réattribue automatiquement CETTE mission (peu importe le
 # bouton de catégorie cliqué) au lieu d'un tirage aléatoire.
 
-def definir_mission_a_refaire(guild_id, joueur_id, texte, delai_texte, cat):
+def definir_mission_a_refaire(guild_id, joueur_id, texte, delai_texte, cat, points=None):
     profils = charger_profils(guild_id)
     initialiser_profil(joueur_id, profils)
-    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": texte, "delai": delai_texte, "cat": cat}
+    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": texte, "delai": delai_texte, "cat": cat, "points": points}
     sauvegarder_profils(guild_id, profils)
 
 def obtenir_mission_a_refaire(guild_id, joueur_id):
@@ -558,6 +1666,124 @@ async def envoyer_double_notification(guild, msg_ticket, msg_missions, view=None
             print(f"Erreur envoi salon validation: {e}")
     
     await envoyer_log_proprietaire(bot, f"[{guild.name}] {msg_missions}", view=VueEvaluationMissionMP if view else None, guild_target=guild, joueur_id_target=joueur_id)
+
+    # Toute notification liée à une mission (fin, succès, échec, demande de
+    # validation...) est aussi déposée côté site web pour ce joueur, afin
+    # d'alimenter la cloche 🔔 de notifications de son compte.
+    if joueur_id is not None:
+        ajouter_notification(guild.id, joueur_id, msg_missions, categorie="mission")
+
+# ================= NOTIFICATIONS SITE WEB (cloche 🔔) =================
+# Stockage simple, par serveur, des notifications destinées à un joueur
+# précis, affichées côté site (icône cloche qui passe au rouge quand il y
+# a du nouveau). Pour l'instant utilisé pour tout ce qui concerne les
+# missions (fin de mission, succès/échec, demande de validation...), mais
+# conçu pour être réutilisé par d'autres systèmes (rankup, etc.) via la
+# `categorie` passée à ajouter_notification.
+
+MAX_NOTIFICATIONS_PAR_JOUEUR = 100
+
+def get_notifications_file(guild_id):
+    return f"valerius_notifications_{guild_id}.json"
+
+def charger_notifications(guild_id):
+    file_name = get_notifications_file(guild_id)
+    if not os.path.exists(file_name):
+        return []
+    try:
+        with open(file_name, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def sauvegarder_notifications(guild_id, notifications):
+    with open(get_notifications_file(guild_id), "w", encoding="utf-8") as f:
+        json.dump(notifications, f, indent=4, ensure_ascii=False)
+
+def ajouter_notification(guild_id, joueur_id, texte, categorie="mission", lien=None):
+    """Ajoute une notification pour `joueur_id`. `categorie` sert à choisir
+    l'icône côté site (ex: 'mission' -> 🔔, 'rankup' -> 🎖️). Retourne
+    l'entrée créée, ou None si joueur_id est vide."""
+    if not joueur_id:
+        return None
+    notifications = charger_notifications(guild_id)
+    entree = {
+        "id": secrets.token_hex(8),
+        "joueur_id": str(joueur_id),
+        "texte": texte,
+        "categorie": categorie,
+        "lien": lien,
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+        "lu": False,
+    }
+    notifications.insert(0, entree)
+    # Ne garde que les MAX_NOTIFICATIONS_PAR_JOUEUR plus récentes de CE
+    # joueur, pour ne pas laisser le fichier grossir indéfiniment.
+    ids_de_ce_joueur = [n["id"] for n in notifications if n["joueur_id"] == entree["joueur_id"]]
+    if len(ids_de_ce_joueur) > MAX_NOTIFICATIONS_PAR_JOUEUR:
+        a_retirer = set(ids_de_ce_joueur[MAX_NOTIFICATIONS_PAR_JOUEUR:])
+        notifications = [n for n in notifications if n["id"] not in a_retirer]
+    sauvegarder_notifications(guild_id, notifications)
+    # Réveille en temps réel toute connexion ouverte sur le site (cloche 🔔)
+    # pour ce joueur, sans attendre le prochain sondage automatique.
+    try:
+        site_web.notifier_maj_notifications(guild_id, joueur_id)
+    except Exception as e:
+        print(f"Erreur notification temps réel (cloche) : {e}")
+    return entree
+
+def obtenir_notifications(guild_id, joueur_id):
+    return [n for n in charger_notifications(guild_id) if n["joueur_id"] == str(joueur_id)]
+
+def compter_notifications_non_lues(guild_id, joueur_id):
+    return sum(1 for n in obtenir_notifications(guild_id, joueur_id) if not n.get("lu"))
+
+def marquer_notifications_lues(guild_id, joueur_id):
+    notifications = charger_notifications(guild_id)
+    joueur_id = str(joueur_id)
+    modifie = False
+    for n in notifications:
+        if n["joueur_id"] == joueur_id and not n.get("lu"):
+            n["lu"] = True
+            modifie = True
+    if modifie:
+        sauvegarder_notifications(guild_id, notifications)
+        try:
+            site_web.notifier_maj_notifications(guild_id, joueur_id)
+        except Exception as e:
+            print(f"Erreur notification temps réel (cloche) : {e}")
+
+# ---- Variantes multi-serveurs (cloche 🔔 des comptes Propriétaire) ----
+# Un compte Propriétaire n'a pas forcément de guild_id unique assigné (il a
+# accès à TOUS les serveurs) : ces variantes agrègent donc les notifications
+# d'une liste de serveurs au lieu d'un seul, pour que sa cloche fonctionne
+# elle aussi, comme demandé.
+
+def obtenir_notifications_multi(guild_ids, joueur_id):
+    """Comme obtenir_notifications, mais agrège plusieurs serveurs. Chaque
+    notification renvoyée porte en plus son 'guild_id' d'origine."""
+    resultat = []
+    for guild_id in guild_ids:
+        for n in obtenir_notifications(guild_id, joueur_id):
+            n = dict(n)
+            n["guild_id"] = guild_id
+            resultat.append(n)
+
+    def _clef_tri(n):
+        try:
+            return datetime.strptime(n["date"], "%d/%m/%Y à %H:%M")
+        except Exception:
+            return datetime.min
+
+    resultat.sort(key=_clef_tri, reverse=True)
+    return resultat
+
+def compter_notifications_non_lues_multi(guild_ids, joueur_id):
+    return sum(compter_notifications_non_lues(g, joueur_id) for g in guild_ids)
+
+def marquer_notifications_lues_multi(guild_ids, joueur_id):
+    for g in guild_ids:
+        marquer_notifications_lues(g, joueur_id)
 
 # ================= SYSTÈME DE BLÂMES — "OSIRIS" =================
 # Module disciplinaire, distinct de la gestion des missions (Valerius).
@@ -854,6 +2080,397 @@ def retirer_rankup_par_index(guild_id, joueur_id, index):
     sauvegarder_rankups(guild_id, rankups)
     return retire
 
+# ================= SYSTÈME DES RANGS DU ROYAUME — "SIRIUS" =================
+# Catalogue des rangs (modifiable par les Propriétaires sur le site),
+# demandes de rang faites par les joueurs (avec vérification automatique
+# de certaines conditions à partir de l'historique du joueur), et page de
+# traitement des demandes pour les instructeurs.
+
+GROUPES_RANGS = ["Recrue", "Membre", "Officier", "Unique"]
+
+def rangs_par_defaut():
+    """Catalogue de départ, basé sur la hiérarchie fournie par l'utilisateur.
+    Entièrement modifiable ensuite depuis /admin/rangs/<guild_id> (Propriétaire)."""
+    return [
+        {
+            "id": "recrue", "nom": "RECRUE", "icone": "🪖", "groupe": "Recrue",
+            "ordre": 0, "unique": False,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [],
+                           "manuel": ["Rejoindre le royaume"]},
+            "debloque": ["Un BK dans l'espace recrue", "Un stuff de départ", "L'accès au F home",
+                         "L'accès au système de mission", "L'accès à l'entreprise agricole", "L'accès aux spawners"],
+        },
+        {
+            "id": "ecuyer", "nom": "ECUYER", "icone": "🪖", "groupe": "Recrue",
+            "ordre": 1, "unique": False,
+            "conditions": {"semaines_min": 1, "blames_max": None, "missions_min": {},
+                           "missions_alt": [{"commune": 3}, {"moyenne": 1}], "manuel": []},
+            "debloque": ["Accès à la zone \"Potion\"", "Accès à l'entreprise de réparation",
+                         "Accès à de plus grands BK (à venir)"],
+        },
+        {
+            "id": "chevalier", "nom": "CHEVALIER", "icone": "🪖", "groupe": "Recrue",
+            "ordre": 2, "unique": False,
+            "conditions": {"semaines_min": 3, "blames_max": 3, "missions_min": {"commune": 5, "moyenne": 1},
+                           "missions_alt": [], "manuel": []},
+            "debloque": ["Accès au diplôme", "Accès à l'entreprise de build / terraforming", "La Banque"],
+        },
+        {
+            "id": "lieutenant", "nom": "LIEUTENANT", "icone": "🛡️", "groupe": "Membre",
+            "ordre": 3, "unique": False,
+            "conditions": {"semaines_min": 5, "blames_max": None,
+                           "missions_min": {"commune": 5, "moyenne": 3, "difficile": 1}, "missions_alt": [],
+                           "manuel": ["Avoir l'approbation de la majorité des Haut-gradés",
+                                      "Réussir un examen et passer un entretien",
+                                      "Réussir l'examen \"Diplomatie 1\""]},
+            "debloque": ["Le grade Haut-gradé", "Les métiers fondamentaux",
+                         "Les permissions dans la base lunaire du royaume", "L'accès à l'entreprise de pétrole"],
+        },
+        {
+            "id": "capitaine", "nom": "CAPITAINE", "icone": "🛡️", "groupe": "Membre",
+            "ordre": 4, "unique": False,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [], "manuel": []},
+            "debloque": ["BK avec un espace dédié aux panneaux solaires"],
+        },
+        {
+            "id": "marechal", "nom": "MARÉCHAL", "icone": "🛡️", "groupe": "Membre",
+            "ordre": 5, "unique": False,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [], "manuel": []},
+            "debloque": [],
+        },
+        {
+            "id": "duc", "nom": "DUC", "icone": "⚜️", "groupe": "Officier",
+            "ordre": 6, "unique": False,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [], "manuel": []},
+            "debloque": [],
+        },
+        {
+            "id": "grand_duc", "nom": "GRAND-DUC", "icone": "⚜️", "groupe": "Officier",
+            "ordre": 7, "unique": False,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [],
+                           "manuel": ["Avoir une fusée personnelle"]},
+            "debloque": [],
+        },
+        {
+            "id": "archiduc", "nom": "ARCHIDUC", "icone": "👑", "groupe": "Unique",
+            "ordre": 8, "unique": True,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [], "manuel": []},
+            "debloque": [],
+        },
+        {
+            "id": "roi", "nom": "ROI", "icone": "👑", "groupe": "Unique",
+            "ordre": 9, "unique": True,
+            "conditions": {"semaines_min": 0, "blames_max": None, "missions_min": {}, "missions_alt": [], "manuel": []},
+            "debloque": [],
+        },
+    ]
+
+def get_rangs_file(guild_id):
+    return f"valerius_rangs_{guild_id}.json"
+
+def charger_rangs(guild_id):
+    file_name = get_rangs_file(guild_id)
+    if not os.path.exists(file_name):
+        rangs = rangs_par_defaut()
+        sauvegarder_rangs(guild_id, rangs)
+        return rangs
+    try:
+        with open(file_name, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return rangs_par_defaut()
+
+def sauvegarder_rangs(guild_id, rangs):
+    with open(get_rangs_file(guild_id), "w", encoding="utf-8") as f:
+        json.dump(rangs, f, indent=4, ensure_ascii=False)
+
+def obtenir_rang_par_id(guild_id, rang_id):
+    return next((r for r in charger_rangs(guild_id) if r["id"] == rang_id), None)
+
+def obtenir_rang_joueur(guild_id, joueur_id):
+    """Rang actuel d'un joueur. Si aucun rang n'a jamais été attribué, il
+    est considéré au rang le plus bas du catalogue (ordre minimal)."""
+    profils = charger_profils(guild_id)
+    profil = profils.get(str(joueur_id), {})
+    rang_id = profil.get("rang")
+    rangs = charger_rangs(guild_id)
+    if rang_id:
+        r = next((r for r in rangs if r["id"] == rang_id), None)
+        if r:
+            return r
+    return min(rangs, key=lambda r: r["ordre"]) if rangs else None
+
+def definir_rang_joueur(guild_id, joueur_id, rang_id):
+    profils = charger_profils(guild_id)
+    initialiser_profil(joueur_id, profils)
+    profils[str(joueur_id)]["rang"] = rang_id
+    sauvegarder_profils(guild_id, profils)
+
+def compter_missions_reussies_par_categorie(guild_id, joueur_id):
+    profils = charger_profils(guild_id)
+    profil = profils.get(str(joueur_id), {})
+    compteur = {"commune": 0, "moyenne": 0, "difficile": 0, "royal": 0}
+    for entree in profil.get("historique", []):
+        if entree.get("statut") == "Succès" and entree.get("categorie") in compteur:
+            compteur[entree["categorie"]] += 1
+    return compteur
+
+def obtenir_semaines_anciennete(guild, joueur_id):
+    """Ancienneté dans le royaume = date d'arrivée du membre sur le serveur
+    Discord (approximation raisonnable de son temps de jeu réel)."""
+    membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
+    if not membre or not membre.joined_at:
+        return None
+    delta = datetime.now(membre.joined_at.tzinfo) - membre.joined_at
+    return delta.days // 7
+
+def verifier_conditions_rang(guild, joueur_id, rang):
+    """Vérifie automatiquement ce qui peut l'être (ancienneté, blâmes,
+    missions réussies) à partir de l'historique du joueur. Le reste
+    (approbations, examens, entretiens, objets possédés en jeu...) est
+    listé sous 'manuel', à vérifier par un instructeur."""
+    conditions = rang.get("conditions", {})
+    rapport = {"auto": [], "manuel": [], "toutes_auto_ok": True}
+
+    semaines_min = conditions.get("semaines_min") or 0
+    if semaines_min:
+        semaines = obtenir_semaines_anciennete(guild, joueur_id)
+        ok = semaines is not None and semaines >= semaines_min
+        rapport["auto"].append({"libelle": f"Avoir au moins {semaines_min} semaine(s) de jeu dans le royaume",
+                                 "ok": ok, "valeur_actuelle": semaines})
+        rapport["toutes_auto_ok"] = rapport["toutes_auto_ok"] and ok
+
+    blames_max = conditions.get("blames_max")
+    if blames_max is not None:
+        nb_blames = len(obtenir_blames_actifs(guild.id, joueur_id))
+        ok = nb_blames <= blames_max
+        rapport["auto"].append({"libelle": f"Avoir au maximum {blames_max} blâme(s) actif(s)",
+                                 "ok": ok, "valeur_actuelle": nb_blames})
+        rapport["toutes_auto_ok"] = rapport["toutes_auto_ok"] and ok
+
+    compteur = compter_missions_reussies_par_categorie(guild.id, joueur_id)
+    missions_min = conditions.get("missions_min") or {}
+    for cat, minimum in missions_min.items():
+        if minimum:
+            ok = compteur.get(cat, 0) >= minimum
+            rapport["auto"].append({"libelle": f"Avoir réussi au moins {minimum} mission(s) {cat}(s)",
+                                     "ok": ok, "valeur_actuelle": compteur.get(cat, 0)})
+            rapport["toutes_auto_ok"] = rapport["toutes_auto_ok"] and ok
+
+    missions_alt = conditions.get("missions_alt") or []
+    if missions_alt:
+        resultats_alt = [all(compteur.get(cat, 0) >= mini for cat, mini in combi.items()) for combi in missions_alt]
+        alt_ok = any(resultats_alt)
+        libelle_alt = " OU ".join(
+            " et ".join(f"{mini} {cat}(s)" for cat, mini in combi.items()) for combi in missions_alt
+        )
+        rapport["auto"].append({"libelle": f"Avoir réussi au moins : {libelle_alt}",
+                                 "ok": alt_ok, "valeur_actuelle": compteur})
+        rapport["toutes_auto_ok"] = rapport["toutes_auto_ok"] and alt_ok
+
+    for texte in conditions.get("manuel", []):
+        rapport["manuel"].append({"libelle": texte})
+
+    return rapport
+
+def get_demandes_rang_file(guild_id):
+    return f"valerius_demandes_rang_{guild_id}.json"
+
+def charger_demandes_rang(guild_id):
+    file_name = get_demandes_rang_file(guild_id)
+    if not os.path.exists(file_name):
+        return []
+    try:
+        with open(file_name, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def sauvegarder_demandes_rang(guild_id, demandes):
+    with open(get_demandes_rang_file(guild_id), "w", encoding="utf-8") as f:
+        json.dump(demandes, f, indent=4, ensure_ascii=False)
+
+def _notifier_instructeurs_nouvelle_demande(guild_id, joueur_id, rang):
+    """Dépose une notification (cloche du site) chez chaque instructeur/
+    propriétaire de ce serveur pour prévenir d'une nouvelle demande de rang."""
+    try:
+        comptes = site_web.charger_comptes()
+    except Exception:
+        return
+    for compte in comptes.values():
+        role = compte.get("role")
+        if role not in ("instructeur", "proprietaire"):
+            continue
+        if role != "proprietaire" and str(compte.get("guild_id")) != str(guild_id):
+            continue
+        cible = compte.get("discord_id")
+        if cible and str(cible) != str(joueur_id):
+            ajouter_notification(guild_id, cible,
+                f"📥 Nouvelle demande de rang : <@{joueur_id}> souhaite devenir {rang['nom']}.",
+                categorie="rankup")
+
+def _poster_discord_sync(coro_factory):
+    """Planifie une coroutine sur la boucle de Sirius depuis un contexte
+    synchrone (les routes Flask du site le sont). N'échoue jamais bruyamment
+    si Sirius n'est pas connecté : le site reste utilisable sans lui."""
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), bot_rangs.loop)
+        future.result(timeout=10)
+    except Exception as e:
+        print(f"Erreur planification message Sirius: {e}")
+
+def _texte_decret_royal(joueur_texte, rang_texte):
+    """Texte officiel du Décret Royal de promotion (même formulation partout :
+    /rankup ET acceptation d'une demande de rang). `joueur_texte` et
+    `rang_texte` sont déjà formatés pour Discord (mention <@id> ou
+    .mention, nom du rang en gras ou mention de rôle)."""
+    return (
+        "◈═══════◈ ◈═══════◈ 𝔇é𝔠𝔯𝔢𝔱 ℜ𝔬𝔶𝔞𝔩 ◈═══════◈ ◈═══════◈\n\n"
+        f"𝔓𝔬𝔲𝔯 𝔰𝔬𝔫 𝔢𝔫𝔤𝔞𝔤𝔢𝔪𝔢𝔫𝔱, 𝔰𝔞 𝔩𝔬𝔶𝔞𝔲𝔱é 𝔢𝔱 𝔰𝔢𝔰 𝔰𝔢𝔯𝔳𝔦𝔠𝔢𝔰 𝔢𝔫𝔳𝔢𝔯𝔰 𝔩𝔢 ℜ𝔬𝔶𝔞𝔲𝔪𝔢, {joueur_texte} 𝔢𝔰𝔱 𝔬𝔣𝔣𝔦𝔠𝔦𝔢𝔩𝔩𝔢𝔪𝔢𝔫𝔱 𝔭𝔯𝔬𝔪𝔲 𝔞𝔲 𝔯𝔞𝔫𝔤 𝔡𝔢 {rang_texte} .\n\n"
+        f"𝔔𝔲𝔢 𝔠𝔢𝔱𝔱𝔢 𝔭𝔯𝔬𝔪𝔬𝔱𝔦𝔬𝔫 𝔰𝔬𝔦𝔱 𝔭𝔬𝔯𝔱é𝔢 𝔞𝔳𝔢𝔠 𝔥𝔬𝔫𝔫𝔢𝔲𝔯 𝔢𝔱 𝔪𝔞𝔯𝔮𝔲𝔢 𝔩𝔢 𝔡é𝔟𝔲𝔱 𝔡𝔢 𝔫𝔬𝔲𝔳𝔢𝔩𝔩𝔢𝔰 𝔯𝔢𝔰𝔭𝔬𝔫𝔰𝔞𝔟𝔦𝔩𝔦𝔱é𝔰. 𝔉é𝔩𝔦𝔠𝔦𝔱𝔞𝔱𝔦𝔬𝔫𝔰 à {joueur_texte}!\n\n"
+        "𝔥𝔞𝔰𝔦𝔫𝔞 𝔥𝔬 𝔞𝔫'𝔫𝔶 𝔉𝔞𝔫𝔧𝔞𝔨𝔞𝔫𝔞! 𝔊𝔩𝔬𝔦𝔯𝔢 𝔞𝔲 ℜ𝔬𝔶𝔞𝔲𝔪𝔢."
+    )
+
+def annoncer_nouvelle_demande_rang(guild_id, joueur_id, rang_id, demande):
+    """Les demandes de rang ne sont volontairement PLUS publiées sur Discord
+    (plus aucun embed dans SALON_DEMANDES_RANG_ID) : seul le staff est prévenu
+    via la cloche de notifications du site. Seule une demande ACCEPTÉE (voir
+    annoncer_decision_rang) ou un /rankup manuel affichent le Décret Royal."""
+    rang = obtenir_rang_par_id(guild_id, rang_id)
+    if not rang:
+        return
+    _notifier_instructeurs_nouvelle_demande(guild_id, joueur_id, rang)
+
+def creer_demande_rang(guild_id, joueur_id, rang_id, motivation):
+    guild = bot.get_guild(int(guild_id))
+    rang = obtenir_rang_par_id(guild_id, rang_id)
+    if not rang:
+        return None
+    rapport_auto = verifier_conditions_rang(guild, joueur_id, rang) if guild else {"auto": [], "manuel": [], "toutes_auto_ok": False}
+    demandes = charger_demandes_rang(guild_id)
+    entree = {
+        "id": secrets.token_hex(8),
+        "joueur_id": str(joueur_id),
+        "rang_id": rang_id,
+        "motivation": motivation,
+        "date": datetime.now().strftime("%d/%m/%Y à %H:%M"),
+        "statut": "en_attente",
+        "rapport_auto": rapport_auto,
+        "traite_par": None,
+        "date_traitement": None,
+        "commentaire": None,
+    }
+    demandes.insert(0, entree)
+    sauvegarder_demandes_rang(guild_id, demandes)
+    annoncer_nouvelle_demande_rang(guild_id, joueur_id, rang_id, entree)
+    return entree
+
+def obtenir_demandes_rang(guild_id, statut=None, joueur_id=None):
+    demandes = charger_demandes_rang(guild_id)
+    if statut:
+        demandes = [d for d in demandes if d["statut"] == statut]
+    if joueur_id is not None:
+        demandes = [d for d in demandes if d["joueur_id"] == str(joueur_id)]
+    return demandes
+
+def obtenir_demande_rang_par_id(guild_id, demande_id):
+    return next((d for d in charger_demandes_rang(guild_id) if d["id"] == demande_id), None)
+
+def annoncer_decision_rang(guild_id, joueur_id, rang, decision, commentaire=None):
+    """Seule une demande ACCEPTÉE publie le Décret Royal dans le salon
+    (SALON_DEMANDES_RANG_ID), avec exactement le même texte que /rankup.
+    Un refus ne s'affiche JAMAIS sur Discord : le joueur est prévenu
+    uniquement via la notification du site (voir traiter_demande_rang)."""
+    if decision != "accepte":
+        return
+    guild = bot.get_guild(int(guild_id))
+    if not guild:
+        return
+
+    async def _envoyer():
+        salon = guild.get_channel(SALON_DEMANDES_RANG_ID)
+        if not salon:
+            return
+        message_decret = _texte_decret_royal(f"<@{joueur_id}>", f"**{rang['nom']}**")
+        try:
+            await salon.send(message_decret)
+        except Exception as e:
+            print(f"Erreur annonce décision de rang: {e}")
+
+    _poster_discord_sync(_envoyer)
+
+def traiter_demande_rang(guild_id, demande_id, decision, instructeur_id, commentaire=None, forcer=False):
+    """decision : 'accepte' ou 'refuse'. Si acceptée, applique le rankup et
+    change le rang effectif du joueur — mais SEULEMENT si le joueur remplit
+    bien toutes les conditions automatiques (ancienneté, blâmes, missions)
+    du rang demandé. Cette vérification est refaite ICI, au moment de la
+    décision (et pas seulement recopiée depuis la création de la demande),
+    pour refléter la situation la plus à jour du joueur : par exemple s'il
+    a fini une mission ou reçu un blâme depuis qu'il a fait sa demande.
+
+    Si une condition automatique n'est pas remplie et que `forcer` n'est
+    pas True, la demande N'EST PAS modifiée (elle reste "en_attente") et la
+    fonction renvoie la chaîne "conditions_non_remplies" (à distinguer de
+    None = demande introuvable/déjà traitée) : à charge de l'appelant
+    d'avertir l'instructeur et de lui proposer, s'il le souhaite vraiment,
+    de forcer la promotion en connaissance de cause (via `forcer=True`).
+    Les conditions "manuelles" (entretien, examen...) ne sont, elles,
+    jamais vérifiables automatiquement : elles n'entrent pas dans ce blocage.
+
+    Retourne la demande mise à jour, "conditions_non_remplies", ou None."""
+    demandes = charger_demandes_rang(guild_id)
+    demande = next((d for d in demandes if d["id"] == demande_id), None)
+    if not demande or demande["statut"] != "en_attente":
+        return None
+    rang = obtenir_rang_par_id(guild_id, demande["rang_id"])
+    if not rang:
+        return None
+
+    if decision == "accepte":
+        guild = bot.get_guild(int(guild_id))
+        rapport_frais = (
+            verifier_conditions_rang(guild, demande["joueur_id"], rang)
+            if guild else demande.get("rapport_auto", {"toutes_auto_ok": False})
+        )
+        # On met à jour le rapport stocké avec cette vérification fraîche,
+        # pour que l'historique reflète la situation réelle au moment de la
+        # décision (et pas seulement celle du jour de la demande).
+        demande["rapport_auto"] = rapport_frais
+        if not rapport_frais.get("toutes_auto_ok", False) and not forcer:
+            sauvegarder_demandes_rang(guild_id, demandes)
+            return "conditions_non_remplies"
+
+    demande["statut"] = decision
+    demande["traite_par"] = str(instructeur_id)
+    demande["date_traitement"] = datetime.now().strftime("%d/%m/%Y à %H:%M")
+    demande["commentaire"] = commentaire
+    sauvegarder_demandes_rang(guild_id, demandes)
+
+    if decision == "accepte":
+        ancien_rang = obtenir_rang_joueur(guild_id, demande["joueur_id"])
+        definir_rang_joueur(guild_id, demande["joueur_id"], rang["id"])
+        ajouter_rankup(guild_id, demande["joueur_id"], "promotion",
+                       ancien_rang["nom"] if ancien_rang else None, rang["nom"],
+                       instructeur_id, raison="Demande de rang validée")
+        ajouter_notification(guild_id, demande["joueur_id"],
+            f"🎖️ Ta demande pour devenir {rang['nom']} a été **acceptée** !", categorie="rankup")
+    else:
+        ajouter_notification(guild_id, demande["joueur_id"],
+            f"📋 Ta demande pour devenir {rang['nom']} a été refusée." + (f" Motif : {commentaire}" if commentaire else ""),
+            categorie="rankup")
+        # On efface l'indicateur d'éligibilité pour ce rang : si le joueur
+        # remplit toujours les conditions automatiques, la boucle proactive
+        # (voir _notifier_joueurs_eligibles_rang) pourra le reprévenir plus
+        # tard, au lieu de rester silencieuse pour toujours après un refus.
+        profils = charger_profils(guild_id)
+        profil = profils.get(str(demande["joueur_id"]))
+        if profil and profil.get("eligibilite_notifiee") == rang["id"]:
+            profil["eligibilite_notifiee"] = None
+            sauvegarder_profils(guild_id, profils)
+
+    annoncer_decision_rang(guild_id, demande["joueur_id"], rang, decision, commentaire)
+    return demande
+
 @tasks.loop(hours=2)
 async def verifier_blames_expires_periodique():
     for g_id in _lister_guildes_avec_fichier("valerius_blames_"):
@@ -866,6 +2483,179 @@ async def avant_verifier_blames_expires_periodique():
 @verifier_blames_expires_periodique.error
 async def verifier_blames_expires_periodique_erreur(erreur):
     print(f"[BLÂMES] Erreur boucle de nettoyage : {erreur}")
+
+# ================= RAPPELS AUTOMATIQUES (cloche 🔔 + MP) =================
+# Étend le système de notifications existant (ajouter_notification) avec de
+# vrais rappels proactifs, envoyés une seule fois par événement (pas de
+# spam) grâce à un indicateur posé sur l'élément concerné une fois le
+# rappel envoyé :
+#  - mission bientôt expirée (encore active, plus assez de temps restant) ;
+#  - demande de rang en attente depuis trop longtemps (relance le staff) ;
+#  - joueur devenu éligible à un nouveau rang (le prévient, mais NE dépose
+#    JAMAIS de candidature à sa place — voir _notifier_joueurs_eligibles_rang).
+
+SEUIL_RAPPEL_MISSION = timedelta(hours=3)  # rappel envoyé une fois passé ce seuil de temps restant
+SEUIL_RAPPEL_DEMANDE_RANG = timedelta(days=2)  # relance si la demande attend depuis plus longtemps
+DELAI_ENTRE_RELANCES_DEMANDE_RANG = timedelta(days=2)  # espace les relances suivantes
+
+async def _rappeler_missions_bientot_expirees():
+    """Envoie un MP (+ notification site) au joueur dont la mission active
+    passe sous SEUIL_RAPPEL_MISSION de temps restant, une seule fois par
+    mission (indicateur 'rappel_expiration_envoye' sur l'entrée en mémoire)."""
+    maintenant = datetime.now()
+    for guild_id, j_dict in list(missions_actives.items()):
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        for joueur_id, m_info in list(j_dict.items()):
+            try:
+                if m_info.get("en_attente", False) or m_info.get("rappel_expiration_envoye"):
+                    continue
+                temps_restant = m_info["date_fin"] - maintenant
+                if timedelta(0) < temps_restant <= SEUIL_RAPPEL_MISSION:
+                    m_info["rappel_expiration_envoye"] = True
+                    texte = (
+                        f"⏳ Ta mission *\"{m_info['texte']}\"* expire bientôt "
+                        f"(il te reste {formater_duree(temps_restant)}) ! Pense à la valider à temps."
+                    )
+                    membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
+                    if membre:
+                        try:
+                            await membre.send(f"⏳ **Rappel — Valerius**\n{texte}")
+                        except Exception as e:
+                            print(f"[RAPPELS] MP impossible pour {joueur_id} (mission bientôt expirée) : {e}")
+                    ajouter_notification(guild_id, joueur_id, texte, categorie="rappel")
+            except Exception as e:
+                print(f"[RAPPELS] Erreur sur guild={guild_id} joueur={joueur_id} (mission) : {e}")
+                continue
+
+async def _rappeler_demandes_rang_en_attente():
+    """Relance le staff (salon des demandes + cloche des instructeurs) pour
+    toute demande de rang encore 'en_attente' depuis plus de
+    SEUIL_RAPPEL_DEMANDE_RANG, en espaçant les relances suivantes de
+    DELAI_ENTRE_RELANCES_DEMANDE_RANG (indicateur 'dernier_rappel' sur la
+    demande, persisté sur disque)."""
+    maintenant = datetime.now()
+    for guild_id in _lister_guildes_avec_fichier("valerius_demandes_rang_"):
+        try:
+            demandes = charger_demandes_rang(guild_id)
+        except Exception as e:
+            print(f"[RAPPELS] Erreur chargement demandes de rang guild={guild_id} : {e}")
+            continue
+        modifie = False
+        for demande in demandes:
+            try:
+                if demande.get("statut") != "en_attente":
+                    continue
+                date_creation = datetime.strptime(demande["date"], "%d/%m/%Y à %H:%M")
+                dernier_rappel = demande.get("dernier_rappel")
+                reference = datetime.fromisoformat(dernier_rappel) if dernier_rappel else date_creation
+                seuil = DELAI_ENTRE_RELANCES_DEMANDE_RANG if dernier_rappel else SEUIL_RAPPEL_DEMANDE_RANG
+                if maintenant - reference < seuil:
+                    continue
+                rang = obtenir_rang_par_id(guild_id, demande["rang_id"])
+                nom_rang = rang["nom"] if rang else demande["rang_id"]
+                jours_attente = (maintenant - date_creation).days
+                _notifier_instructeurs_nouvelle_demande(
+                    guild_id, demande["joueur_id"],
+                    {"nom": f"{nom_rang} (⏰ en attente depuis {jours_attente} jour(s))"},
+                )
+                demande["dernier_rappel"] = maintenant.isoformat()
+                modifie = True
+            except Exception as e:
+                print(f"[RAPPELS] Erreur sur une demande de rang guild={guild_id} : {e}")
+                continue
+        if modifie:
+            sauvegarder_demandes_rang(guild_id, demandes)
+
+def _a_deja_une_demande_en_attente(guild_id, joueur_id, rang_id):
+    """Vrai si le joueur a déjà une demande de rang 'en_attente' pour ce
+    rang précis (inutile de le prévenir s'il a déjà postulé)."""
+    return any(
+        d.get("joueur_id") == str(joueur_id) and d.get("rang_id") == rang_id and d.get("statut") == "en_attente"
+        for d in charger_demandes_rang(guild_id)
+    )
+
+async def _notifier_joueurs_eligibles_rang():
+    """Parcourt tous les joueurs de chaque serveur et, dès que l'un d'eux
+    remplit TOUTES les conditions automatiquement vérifiables (ancienneté,
+    blâmes, missions...) pour son prochain rang, le prévient (MP + cloche 🔔
+    du site) qu'il peut désormais postuler.
+
+    IMPORTANT : ceci ne dépose PAS de candidature à sa place — la demande de
+    rang reste à faire par le joueur lui-même (bouton du site / commande) ;
+    Sirius se contente de le prévenir qu'il est temps de le faire. Un
+    indicateur 'eligibilite_notifiee' (persisté sur le profil) empêche de le
+    reprévenir en boucle pour le même rang ; il est remis à zéro dès que le
+    rang visé change (promotion) ou qu'une demande refusée le laisse encore
+    éligible (voir traiter_demande_rang)."""
+    for guild_id in _lister_guildes_avec_fichier("valerius_profils_"):
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        try:
+            rangs = sorted(charger_rangs(guild_id), key=lambda r: r["ordre"])
+            profils = charger_profils(guild_id)
+        except Exception as e:
+            print(f"[RAPPELS] Erreur chargement rangs/profils guild={guild_id} : {e}")
+            continue
+        if not rangs:
+            continue
+        modifie = False
+        for joueur_id, profil in list(profils.items()):
+            try:
+                rang_actuel = obtenir_rang_joueur(guild_id, joueur_id)
+                if not rang_actuel:
+                    continue
+                suivants = [r for r in rangs if r["ordre"] > rang_actuel["ordre"] and not r.get("unique")]
+                if not suivants:
+                    continue
+                prochain = suivants[0]
+                if profil.get("eligibilite_notifiee") == prochain["id"]:
+                    continue  # déjà prévenu pour ce rang précis
+                rapport = verifier_conditions_rang(guild, joueur_id, prochain)
+                if not rapport["toutes_auto_ok"]:
+                    continue
+                if _a_deja_une_demande_en_attente(guild_id, joueur_id, prochain["id"]):
+                    profil["eligibilite_notifiee"] = prochain["id"]
+                    modifie = True
+                    continue
+                texte = (
+                    f"🌟 Tu remplis désormais toutes les conditions automatiques pour "
+                    f"devenir **{prochain['nom']}** ! Ta candidature n'est pas envoyée "
+                    f"automatiquement : pense à déposer ta demande de rang toi-même "
+                    f"(site ou commande dédiée)."
+                )
+                membre = guild.get_member(int(joueur_id)) if str(joueur_id).isdigit() else None
+                if membre:
+                    try:
+                        await membre.send(f"🌟 **Sirius — Système des rangs**\n{texte}")
+                    except Exception as e:
+                        print(f"[RAPPELS] MP impossible pour {joueur_id} (éligibilité rang) : {e}")
+                ajouter_notification(guild_id, joueur_id, texte, categorie="rankup")
+                profil["eligibilite_notifiee"] = prochain["id"]
+                modifie = True
+            except Exception as e:
+                print(f"[RAPPELS] Erreur sur une éligibilité de rang guild={guild_id} joueur={joueur_id} : {e}")
+                continue
+        if modifie:
+            sauvegarder_profils(guild_id, profils)
+
+@tasks.loop(minutes=30)
+async def verifier_rappels_periodique():
+    await _rappeler_missions_bientot_expirees()
+    await _rappeler_demandes_rang_en_attente()
+    await _notifier_joueurs_eligibles_rang()
+
+@verifier_rappels_periodique.before_loop
+async def avant_verifier_rappels_periodique():
+    await bot.wait_until_ready()
+
+@verifier_rappels_periodique.error
+async def verifier_rappels_periodique_erreur(erreur):
+    print(f"[RAPPELS] La boucle a planté et va être redémarrée : {erreur}")
+    if not verifier_rappels_periodique.is_running():
+        verifier_rappels_periodique.start()
 
 class VueFermerTicket(VueVerrouillable):
     def __init__(self):
@@ -884,7 +2674,7 @@ class VueFermerTicket(VueVerrouillable):
                     break
 
         try: await interaction.channel.delete()
-        except: pass
+        except Exception: pass
 
 class VueButinRecupere(VueVerrouillable):
     def __init__(self):
@@ -897,7 +2687,7 @@ class VueButinRecupere(VueVerrouillable):
             child.disabled = True
         try:
             await interaction.response.edit_message(view=self)
-        except:
+        except Exception:
             pass
         await interaction.channel.send("✅ **Le butin a été récupéré avec succès par l'instructeur.**", view=VueFermerTicket())
 
@@ -986,7 +2776,7 @@ class VueGestionJoueurMission(VueVerrouillable):
         for child in self.children: child.disabled = True
         try:
             await interaction.response.edit_message(view=self)
-        except:
+        except Exception:
             await interaction.response.defer(ephemeral=True)
 
         role_instructeur = discord.utils.get(interaction.guild.roles, name="[ 🎴[Instruction] ]")
@@ -1027,7 +2817,7 @@ class VueGestionJoueurMission(VueVerrouillable):
         for child in self.children: child.disabled = True
         try:
             await interaction.response.edit_message(view=self)
-        except:
+        except Exception:
             await interaction.response.defer(ephemeral=True)
             
         await action_refuser_mission(target_id, interaction.channel)
@@ -1046,7 +2836,7 @@ class VueEvaluationMission(VueVerrouillable):
         
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
         
         target_j_id = self.joueur_id
         g_id = interaction.guild.id
@@ -1074,7 +2864,7 @@ class VueEvaluationMission(VueVerrouillable):
         
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
         
         target_j_id = self.joueur_id
         g_id = interaction.guild.id
@@ -1102,7 +2892,7 @@ class VueEvaluationMission(VueVerrouillable):
 
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
         
         target_j_id = self.joueur_id
         target_guild = interaction.guild
@@ -1133,7 +2923,7 @@ class VueEvaluationMissionMP(VueVerrouillable):
     async def eval_mp_accepter(self, interaction: discord.Interaction, button: discord.ui.Button):
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
 
         chan_cible = None
         if self.guild_target and self.guild_target.id in missions_actives and self.joueur_id in missions_actives[self.guild_target.id]:
@@ -1151,7 +2941,7 @@ class VueEvaluationMissionMP(VueVerrouillable):
     async def eval_mp_refuser(self, interaction: discord.Interaction, button: discord.ui.Button):
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
 
         chan_cible = None
         if self.guild_target and self.guild_target.id in missions_actives and self.joueur_id in missions_actives[self.guild_target.id]:
@@ -1169,7 +2959,7 @@ class VueEvaluationMissionMP(VueVerrouillable):
     async def eval_mp_preuve(self, interaction: discord.Interaction, button: discord.ui.Button):
         for child in self.children: child.disabled = True
         try: await interaction.response.edit_message(view=self)
-        except: pass
+        except Exception: pass
 
         chan_cible = None
         if self.guild_target and self.guild_target.id in missions_actives and self.joueur_id in missions_actives[self.guild_target.id]:
@@ -1189,15 +2979,28 @@ async def action_accepter_mission(joueur_id, channel):
         profils = charger_profils(g_id)
         initialiser_profil(joueur_id, profils)
         profils[str(joueur_id)]["total_reussies"] += 1
+        # La mission a-t-elle des points spécifiques (surcharge) ? Sinon on
+        # retombe sur les points de sa catégorie.
+        points_override = m_info.get("points_override")
+        points_gagnes = points_override if points_override is not None else points_pour_categorie(g_id, m_info["cat"])
+        profils[str(joueur_id)]["total_points"] += points_gagnes
         duree_secondes = (datetime.now() - m_info["date_debut"]).total_seconds()
-        ajouter_historique(joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes)
+        ajouter_historique(joueur_id, profils, m_info["texte"], "Succès", m_info["cat"], duree_secondes, points=points_gagnes)
         # Mission enfin réussie : on efface le "à refaire" s'il y en avait un.
         if "mission_a_refaire" in profils.get(str(joueur_id), {}):
             del profils[str(joueur_id)]["mission_a_refaire"]
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
-        
-        msg = "✅ **Mission Validée** ! L'objectif est consigné comme réussi dans le grand registre.\n\n🚚 **Un instructeur va venir récupérer le butin.**"
+
+        # Mission moyenne/difficile/royale réussie : un ticket de roue est
+        # offert (utilisable ensuite sur la roue de son choix, voir /roue).
+        # Pas de ticket pour les missions "commune".
+        texte_ticket = ""
+        if m_info["cat"] in ("moyenne", "difficile", "royal"):
+            total_tickets = ajouter_tickets_roue(g_id, joueur_id, 1)
+            texte_ticket = f"\n🎟️ **+1 ticket de roue** (total : {total_tickets}) — utilisable sur la roue de ton choix sur le site !"
+
+        msg = f"✅ **Mission Validée** ! L'objectif est consigné comme réussi dans le grand registre.\n🏅 **+{points_gagnes} points** (total : {profils[str(joueur_id)]['total_points']}).{texte_ticket}\n\n🚚 **Un instructeur va venir récupérer le butin.**"
         await channel.send(msg, view=VueButinRecupere())
         await envoyer_double_notification(guild, msg, f"✅ **Mission accomplie** par <@{joueur_id}> : *\"{m_info['texte']}\"*", joueur_id=joueur_id)
         await envoyer_log_proprietaire(bot, f"LOG ABSOLU - ACTION ACCEPTER MISSION : Joueur {joueur_id} validé sur {guild.name}")
@@ -1216,7 +3019,7 @@ async def action_refuser_mission(joueur_id, channel):
         ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
         # Mission échouée/abandonnée/refusée : on la mémorise pour que le
         # joueur retombe automatiquement dessus à sa prochaine tentative.
-        profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"]}
+        profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"], "points": m_info.get("points_override")}
         sauvegarder_profils(g_id, profils)
         del missions_actives[g_id][joueur_id]
         
@@ -1249,6 +3052,82 @@ async def action_demander_preuve(joueur_id, channel, guild):
         return True
     return False
 
+async def attribuer_mission_precise_site(guild, joueur_id, texte, delai_texte, cat, points, attribue_par):
+    """Attribue une mission PRÉCISE (texte, délai, catégorie et destinataire
+    tous choisis un par un, typiquement depuis le formulaire du site web —
+    contrairement à /attribuer_mission qui tire une mission au hasard dans
+    la catégorie). Crée un nouveau salon de ticket comme le fait /openticket,
+    puis y poste directement le décret déjà choisi (le joueur n'a donc pas
+    à choisir de difficulté : le chrono démarre immédiatement).
+
+    Ne lève jamais d'exception : renvoie toujours un dict {"ok": bool, ...},
+    avec une clé "erreur" lisible par un humain si "ok" est False, pour un
+    affichage direct sur le site."""
+    g_id = guild.id
+    joueur = guild.get_member(joueur_id)
+    if not joueur:
+        return {"ok": False, "erreur": "Ce membre est introuvable sur ce serveur Discord (a-t-il bien quitté/rejoint récemment ?)."}
+
+    if g_id in missions_actives and joueur_id in missions_actives[g_id]:
+        return {"ok": False, "erreur": f"{joueur.display_name} a déjà une mission active en cours sur ce serveur."}
+
+    try:
+        role_instructeur = discord.utils.get(guild.roles, name="[ 🎴[Instruction] ]")
+        role_palais = discord.utils.get(guild.roles, name="[ Palais Royal ]") or discord.utils.get(guild.roles, name="Palais Royal")
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            joueur: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True),
+        }
+        if role_instructeur:
+            overwrites[role_instructeur] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
+        if role_palais:
+            overwrites[role_palais] = discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True)
+
+        nom_salon = f"📜-ordre-{joueur.name}"
+        ticket_channel = await guild.create_text_channel(name=nom_salon, overwrites=overwrites)
+    except Exception as e:
+        return {"ok": False, "erreur": f"Impossible de créer le salon du ticket : {e}"}
+
+    duree = extraire_duree(delai_texte)
+    date_fin = datetime.now() + duree
+    timestamp_discord = int(date_fin.timestamp())
+
+    if g_id not in missions_actives:
+        missions_actives[g_id] = {}
+
+    missions_actives[g_id][joueur_id] = {
+        "texte": texte,
+        "delai_texte": delai_texte,
+        "date_debut": datetime.now(),
+        "date_fin": date_fin,
+        "duree_totale": duree,
+        "cat": cat,
+        "channel_id": ticket_channel.id,
+        "alerte_moitie": False,
+        "alerte_un_quart": False,
+        "en_attente": False,
+        "points_override": points,
+    }
+
+    emoji_cat = {"commune": "🟢", "moyenne": "🔵", "difficile": "🟠", "royal": "🔴"}.get(cat, "📜")
+    embed_mission = discord.Embed(title="📜 DÉCRET IMPÉRIAL ATTRIBUÉ PAR L'ADMINISTRATION", color=discord.Color.gold())
+    embed_mission.add_field(name="🎯 Objectif", value=f"*{texte}*", inline=False)
+    embed_mission.add_field(name="🏷️ Catégorie", value=f"{emoji_cat} {cat.capitalize()}", inline=True)
+    embed_mission.add_field(name="⏳ Temps imparti", value=f"<t:{timestamp_discord}:R> (soit le <t:{timestamp_discord}:f>)", inline=False)
+    embed_mission.set_thumbnail(url=joueur.display_avatar.url)
+    embed_mission.set_footer(text=f"Attribué par {attribue_par} depuis le site web.")
+
+    try:
+        await ticket_channel.send(content=joueur.mention, embed=embed_mission, view=VueGestionJoueurMission(joueur_id))
+    except Exception as e:
+        return {"ok": False, "erreur": f"Le salon {ticket_channel.mention} a été créé mais l'envoi du décret a échoué : {e}"}
+
+    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - ATTRIBUTION SITE : Mission précise attribuée à {joueur_id} sur {guild.name} par {attribue_par}.")
+    return {"ok": True, "channel_id": ticket_channel.id, "channel_mention": ticket_channel.mention, "channel_name": ticket_channel.name}
+
+
 async def gerer_expiration_automatique(guild, channel_id, joueur_id):
     await asyncio.sleep(3600)
     g_id = guild.id
@@ -1265,7 +3144,7 @@ async def gerer_expiration_automatique(guild, channel_id, joueur_id):
             f"Cet ordre de mission sera définitivement supprimé et annulé **<t:{expiration_time}:R>** (<t:{expiration_time}:t>)."
         )
         try: await channel.send(msg_expiration_auto)
-        except: return
+        except Exception: return
 
         await asyncio.sleep(3600)
         if g_id not in missions_actives or joueur_id not in missions_actives[g_id]:
@@ -1311,7 +3190,7 @@ async def verifier_temps_missions():
                     duree_secondes = (maintenant - date_debut).total_seconds()
                     ajouter_historique(joueur_id, profils, m_info["texte"], "Échec", m_info["cat"], duree_secondes)
                     # Mission échouée par dépassement du délai : à refaire.
-                    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"]}
+                    profils[str(joueur_id)]["mission_a_refaire"] = {"texte": m_info["texte"], "delai": m_info.get("delai_texte", ""), "cat": m_info["cat"], "points": m_info.get("points_override")}
                     sauvegarder_profils(guild_id, profils)
 
                     role_instructeur = discord.utils.get(guild.roles, name="[ 🎴[Instruction] ]")
@@ -1429,7 +3308,7 @@ class VueChoixDifficulte(VueVerrouillable):
         mission_a_refaire = obtenir_mission_a_refaire(guild_id, self.joueur_id)
         rappel_mission = False
         if mission_a_refaire:
-            mission_choisie = {"texte": mission_a_refaire["texte"], "delai": mission_a_refaire.get("delai", "")}
+            mission_choisie = {"texte": mission_a_refaire["texte"], "delai": mission_a_refaire.get("delai", ""), "points": mission_a_refaire.get("points")}
             cat = mission_a_refaire.get("cat", cat)
             rappel_mission = True
         else:
@@ -1446,7 +3325,8 @@ class VueChoixDifficulte(VueVerrouillable):
         missions_actives[guild_id][self.joueur_id] = {
             "texte": mission_choisie["texte"], "delai_texte": mission_choisie["delai"],
             "date_debut": datetime.now(), "date_fin": date_fin, "duree_totale": duree,
-            "cat": cat, "channel_id": interaction.channel.id, "alerte_moitie": False, "alerte_un_quart": False, "en_attente": False
+            "cat": cat, "channel_id": interaction.channel.id, "alerte_moitie": False, "alerte_un_quart": False, "en_attente": False,
+            "points_override": mission_choisie.get("points")
         }
 
         for child in self.children:
@@ -1800,6 +3680,10 @@ bot.tree.interaction_check = verrou_interaction_check
 # deux bots en même temps, car ils lisent le même fichier + la même variable
 # en mémoire (guildes_deverrouillees), le tout dans le même processus.
 bot_osiris.tree.interaction_check = verrou_interaction_check
+# Sirius (bot_rangs) partage lui aussi exactement le même verrou : sans
+# cette ligne, ses commandes (/rangs, /demanderrang, /validerrang, ...)
+# restaient utilisables même sur un serveur verrouillé pour Valerius.
+bot_rangs.tree.interaction_check = verrou_interaction_check
 
 @bot.check
 async def verrou_commandes_prefixe(ctx):
@@ -1946,6 +3830,8 @@ async def liste_supermodos(interaction: discord.Interaction):
 async def on_ready():
     if not verifier_temps_missions.is_running(): verifier_temps_missions.start()
     if not sauvegarde_automatique.is_running(): sauvegarde_automatique.start()
+    if not verifier_rappels_periodique.is_running(): verifier_rappels_periodique.start()
+    if not synchronisation_drive.is_running(): synchronisation_drive.start()
     
     bot.add_view(VueBoutonTicket())
     bot.add_view(VueFermerTicket())
@@ -1999,6 +3885,16 @@ async def on_ready():
         print(f"Erreur de synchronisation slash (Osiris): {e}")
 
     await envoyer_log_proprietaire(bot_osiris, "⚖️ **Bot Osiris démarré avec succès !** Système disciplinaire opérationnel.")
+
+@bot_rangs.event
+async def on_ready():
+    try:
+        synced = await bot_rangs.tree.sync()
+        print(f"Bot Sirius — {len(synced)} commande(s) slash synchronisée(s) !")
+    except Exception as e:
+        print(f"Erreur de synchronisation slash (Sirius): {e}")
+
+    await envoyer_log_proprietaire(bot_rangs, "🎖️ **Bot Sirius démarré avec succès !** Système des rangs opérationnel.")
 
 @bot.event
 async def on_message(message):
@@ -2112,6 +4008,29 @@ async def tuto(interaction: discord.Interaction):
     embed_tuto.set_footer(text="Valerius • Que la fortune te sourie")
     await interaction.response.send_message(embed=embed_tuto, ephemeral=True)
 
+@bot.tree.command(name="site", description="Affiche le lien du site web (toujours à jour, même si l'adresse change).")
+async def site(interaction: discord.Interaction):
+    # RENDER_EXTERNAL_URL est fournie automatiquement par Render et reflète
+    # toujours l'URL réelle du déploiement en cours (donc "à jour en direct",
+    # sans jamais avoir besoin de modifier le code si l'adresse change).
+    # SITE_URL sert de solution de secours si le bot tourne ailleurs que sur Render.
+    lien = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SITE_URL")
+
+    embed_site = discord.Embed(
+        title="🌐 Site Officiel du Royaume",
+        color=discord.Color.blue()
+    )
+    if lien:
+        embed_site.description = f"Accède au site ici : {lien}"
+    else:
+        embed_site.description = (
+            "⚠️ Aucune URL détectée pour l'instant.\n"
+            "Définis la variable d'environnement `SITE_URL` sur Render "
+            "(ou vérifie que le service web est bien démarré)."
+        )
+    embed_site.set_footer(text="Valerius • Portail du Royaume")
+    await interaction.response.send_message(embed=embed_site, ephemeral=True)
+
 @bot.tree.command(name="openticket", description="Ouvre un ticket de mission pour un citoyen spécifique (Staff uniquement).")
 @app_commands.describe(joueur="Le citoyen pour qui ouvrir le ticket d'ordre")
 async def openticket(interaction: discord.Interaction, joueur: discord.Member):
@@ -2217,7 +4136,8 @@ async def attribuer_mission(interaction: discord.Interaction, joueur: discord.Me
         "channel_id": interaction.channel.id, 
         "alerte_moitie": False, 
         "alerte_un_quart": False, 
-        "en_attente": False
+        "en_attente": False,
+        "points_override": mission_choisie.get("points")
     }
 
     embed_mission = discord.Embed(title="📜 DÉCRET IMPÉRIAL ATTRIBUÉ PAR L'ADMINISTRATION", color=discord.Color.gold())
@@ -2251,7 +4171,8 @@ async def export_actives(interaction: discord.Interaction):
                     "channel_id": m_data["channel_id"],
                     "alerte_moitie": m_data["alerte_moitie"],
                     "alerte_un_quart": m_data["alerte_un_quart"],
-                    "en_attente": m_data["en_attente"]
+                    "en_attente": m_data["en_attente"],
+                    "points_override": m_data.get("points_override")
                 }
 
     if not actives_serveur:
@@ -2302,7 +4223,8 @@ async def import_actives(interaction: discord.Interaction, fichier: discord.Atta
                 "channel_id": m_data["channel_id"],
                 "alerte_moitie": m_data["alerte_moitie"],
                 "alerte_un_quart": m_data["alerte_un_quart"],
-                "en_attente": m_data["en_attente"]
+                "en_attente": m_data["en_attente"],
+                "points_override": m_data.get("points_override")
             }
             nb_restaurees += 1
 
@@ -2313,10 +4235,41 @@ async def import_actives(interaction: discord.Interaction, fichier: discord.Atta
 SALON_BACKUP_AUTO_ID = 1539678291919634452
 TAILLE_MAX_DISCORD = 8 * 1024 * 1024
 
+def _lister_fichiers_texte_a_sauvegarder():
+    """Renvoie la liste de TOUS les fichiers de données du bot à sauvegarder
+    (texte/JSON/JSONL/clé), utilisée à la fois par /total_backup et
+    /sync_drive — donc les deux restent automatiquement synchronisés entre
+    eux.
+
+    Balayage LARGE par préfixe ("valerius_"/"osiris_") plutôt qu'une liste
+    de motifs figée au cas par cas : ça évite d'oublier un fichier
+    existant (c'est arrivé : rankups, blâmes, demandes de rang,
+    notifications, rangs, missions actives, logs, clé secrète... n'étaient
+    pas inclus avant) ET couvre automatiquement tout futur fichier de
+    données créé plus tard (nouveau système, nouveau bot), sans jamais
+    avoir à retoucher cette fonction. Comme Render (plan gratuit) efface
+    tout le disque à chaque redémarrage, l'exhaustivité ici est critique."""
+    motifs = (
+        "valerius_*.json", "valerius_*.txt", "valerius_*.jsonl", "valerius_*.key",
+        "osiris_*.json", "osiris_*.txt", "osiris_*.jsonl", "osiris_*.key",
+    )
+    fichiers = set()
+    for motif in motifs:
+        fichiers.update(glob.glob(motif))
+    return sorted(fichiers)
+
+
+def _lister_images_boutique():
+    """Renvoie la liste des chemins des images de produits de la boutique
+    (dossier plat, tous serveurs confondus)."""
+    return glob.glob(os.path.join(site_web.DOSSIER_IMAGES_BOUTIQUE, "*"))
+
+
 def generer_backup_complet():
     donnees_globales = {
         "missions_actives": {},
-        "fichiers_disques": {}
+        "fichiers_disques": {},
+        "images_boutique_base64": {},
     }
 
     for g_id, j_dict in missions_actives.items():
@@ -2332,26 +4285,28 @@ def generer_backup_complet():
                 "channel_id": m_data["channel_id"],
                 "alerte_moitie": m_data["alerte_moitie"],
                 "alerte_un_quart": m_data["alerte_un_quart"],
-                "en_attente": m_data["en_attente"]
+                "en_attente": m_data["en_attente"],
+                "points_override": m_data.get("points_override")
             }
 
-    import glob
-    fichiers_txt = glob.glob("valerius_missions_*.txt")
-    fichiers_json = glob.glob("valerius_profils_*.json")
-    # Le code d'activation, les comptes du site web et le compteur anti
-    # brute-force doivent eux aussi survivre à un redémarrage sur Render
-    # (disque non-persistant).
-    for f_extra in (VERROU_FILE, site_web.COMPTES_FILE, site_web.SECRET_KEY_FILE, site_web.TENTATIVES_FILE):
-        if os.path.exists(f_extra):
-            fichiers_json.append(f_extra)
-
+    # Fichiers texte/JSON (profils, missions, boutique, comptes du site...).
     contenu_fichiers = {}
-    for f_path in fichiers_txt + fichiers_json:
+    for f_path in _lister_fichiers_texte_a_sauvegarder():
         if os.path.exists(f_path):
             with open(f_path, "r", encoding="utf-8") as f:
                 contenu_fichiers[f_path] = f.read()
-
     donnees_globales["fichiers_disques"] = contenu_fichiers
+
+    # Images de la boutique (binaires) : encodées en base64 pour pouvoir
+    # tenir dans le même fichier JSON de backup que le reste.
+    images_base64 = {}
+    for chemin_image in _lister_images_boutique():
+        try:
+            with open(chemin_image, "rb") as f:
+                images_base64[os.path.basename(chemin_image)] = base64.b64encode(f.read()).decode("ascii")
+        except Exception:
+            pass
+    donnees_globales["images_boutique_base64"] = images_base64
 
     json_data = json.dumps(donnees_globales, indent=4, ensure_ascii=False)
     donnees_octets = json_data.encode("utf-8")
@@ -2421,13 +4376,136 @@ async def sauvegarde_automatique():
 async def avant_sauvegarde_automatique():
     await bot.wait_until_ready()
 
+# ================= SYNCHRONISATION GOOGLE DRIVE (dossier consultable) =================
+# Complète la sauvegarde Discord ci-dessus (archive unique toutes les 2h) par
+# une copie FICHIER PAR FICHIER dans un dossier Google Drive personnel,
+# consultable directement depuis Drive. Voir stockage_drive.py pour la
+# configuration (2 variables d'environnement à définir). Sans configuration,
+# toutes les fonctions ci-dessous sont des no-op silencieux : le bot
+# continue de fonctionner normalement.
+
+PREFIXE_IMAGE_DRIVE = "boutique_image__"
+INTERVALLE_SYNC_DRIVE_MINUTES = 15
+
+
+def synchroniser_vers_drive():
+    """Envoie une copie à jour de chaque fichier de données (JSON/TXT +
+    images de la boutique) vers le dossier Drive configuré. Renvoie le
+    nombre de fichiers effectivement envoyés (0 si Drive n'est pas
+    configuré ou indisponible)."""
+    if not stockage_drive.drive_disponible():
+        return 0
+    nb_envoyes = 0
+    for f_path in _lister_fichiers_texte_a_sauvegarder():
+        try:
+            with open(f_path, "r", encoding="utf-8") as f:
+                contenu = f.read().encode("utf-8")
+            if stockage_drive.uploader_fichier(f_path, contenu, "application/json"):
+                nb_envoyes += 1
+        except Exception as e:
+            print(f"[Drive] Échec de la lecture de « {f_path} » avant envoi : {e}")
+    for chemin_image in _lister_images_boutique():
+        try:
+            with open(chemin_image, "rb") as f:
+                contenu = f.read()
+            nom_drive = PREFIXE_IMAGE_DRIVE + os.path.basename(chemin_image)
+            if stockage_drive.uploader_fichier(nom_drive, contenu, "application/octet-stream"):
+                nb_envoyes += 1
+        except Exception as e:
+            print(f"[Drive] Échec de la lecture de l'image « {chemin_image} » avant envoi : {e}")
+    return nb_envoyes
+
+
+def restaurer_tout_depuis_drive():
+    """Télécharge et réinjecte TOUS les fichiers présents dans le dossier
+    Drive configuré. À appeler UNE FOIS au démarrage, avant que le bot ne
+    se connecte à Discord, pour retrouver l'état d'avant coupure sur un
+    disque Render effacé. Ne fait rien (silencieusement) si Drive n'est
+    pas configuré. Renvoie le nombre de fichiers restaurés."""
+    if not stockage_drive.drive_disponible():
+        print("[Drive] Non configuré (variables d'environnement absentes) — restauration au démarrage ignorée.")
+        return 0
+    noms = stockage_drive.lister_noms_fichiers()
+    nb_restaures = 0
+    for nom in noms:
+        contenu = stockage_drive.telecharger_fichier(nom)
+        if contenu is None:
+            continue
+        try:
+            if nom.startswith(PREFIXE_IMAGE_DRIVE):
+                os.makedirs(site_web.DOSSIER_IMAGES_BOUTIQUE, exist_ok=True)
+                nom_local = nom[len(PREFIXE_IMAGE_DRIVE):]
+                with open(os.path.join(site_web.DOSSIER_IMAGES_BOUTIQUE, nom_local), "wb") as f:
+                    f.write(contenu)
+            else:
+                # Fichiers JSON/TXT : réécrits tels quels, au même chemin
+                # relatif que celui utilisé lors de l'envoi.
+                with open(nom, "w", encoding="utf-8") as f:
+                    f.write(contenu.decode("utf-8"))
+            nb_restaures += 1
+        except Exception as e:
+            print(f"[Drive] Échec de la restauration de « {nom} » : {e}")
+    print(f"[Drive] Restauration au démarrage terminée : {nb_restaures} fichier(s) réinjecté(s).")
+    return nb_restaures
+
+
+@tasks.loop(minutes=INTERVALLE_SYNC_DRIVE_MINUTES)
+async def synchronisation_drive():
+    if not stockage_drive.drive_disponible():
+        return
+    # uploader_fichier() fait des appels réseau bloquants (googleapiclient
+    # n'a pas d'API asyncio) : on les pousse dans un thread pour ne pas
+    # geler la boucle d'événements Discord pendant la synchronisation.
+    nb = await asyncio.to_thread(synchroniser_vers_drive)
+    if nb:
+        print(f"[Drive] Synchronisation périodique : {nb} fichier(s) envoyé(s).")
+
+@synchronisation_drive.before_loop
+async def avant_synchronisation_drive():
+    await bot.wait_until_ready()
+
+@bot.tree.command(name="sync_drive", description="[Propriétaire] Force une synchronisation immédiate vers Google Drive et affiche le statut.")
+async def sync_drive(interaction: discord.Interaction):
+    if not est_proprietaire(interaction.user.id):
+        await interaction.response.send_message("⛔ Réservé aux Propriétaires.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not stockage_drive.drive_disponible():
+        await interaction.followup.send(
+            "⚠️ Google Drive n'est pas configuré (variables GOOGLE_OAUTH_CLIENT_ID / "
+            "GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REFRESH_TOKEN / GOOGLE_DRIVE_DOSSIER_ID "
+            "manquantes ou invalides). Voir stockage_drive.py pour la marche à suivre.",
+            ephemeral=True,
+        )
+        return
+    nb_data = len(_lister_fichiers_texte_a_sauvegarder())
+    nb_images = len(_lister_images_boutique())
+    nb = await asyncio.to_thread(synchroniser_vers_drive)
+    await interaction.followup.send(
+        f"✅ Synchronisation Drive terminée : {nb} fichier(s) envoyé(s) "
+        f"(sur {nb_data} fichier(s) de données + {nb_images} image(s) détecté(s) localement).",
+        ephemeral=True,
+    )
+
 def restaurer_donnees_backup(donnees, channel_fallback=None):
-    """Réinjecte un backup total (fichiers disque + missions en cours).
-    Fonction partagée entre /total_restore (Discord) et le site web admin."""
+    """Réinjecte un backup total (fichiers disque + images boutique +
+    missions en cours). Fonction partagée entre /total_restore (Discord)
+    et le site web admin."""
     fichiers_disques = donnees.get("fichiers_disques", {})
     for f_path, f_contenu in fichiers_disques.items():
         with open(f_path, "w", encoding="utf-8") as f:
             f.write(f_contenu)
+
+    images_base64 = donnees.get("images_boutique_base64", {})
+    if images_base64:
+        os.makedirs(site_web.DOSSIER_IMAGES_BOUTIQUE, exist_ok=True)
+    for nom_image, contenu_base64 in images_base64.items():
+        try:
+            chemin = os.path.join(site_web.DOSSIER_IMAGES_BOUTIQUE, os.path.basename(nom_image))
+            with open(chemin, "wb") as f:
+                f.write(base64.b64decode(contenu_base64))
+        except Exception as e:
+            print(f"[Restauration] Échec de la réinjection de l'image « {nom_image} » : {e}")
 
     global missions_actives
     with verrou_missions:
@@ -2459,11 +4537,114 @@ def restaurer_donnees_backup(donnees, channel_fallback=None):
                 "channel_id": final_channel_id,
                 "alerte_moitie": m_data["alerte_moitie"],
                 "alerte_un_quart": m_data["alerte_un_quart"],
-                "en_attente": m_data["en_attente"]
+                "en_attente": m_data["en_attente"],
+                "points_override": m_data.get("points_override")
             }
             nb_restaurees += 1
 
-    return nb_restaurees, len(fichiers_disques)
+    return nb_restaurees, len(fichiers_disques) + len(images_base64)
+
+# ================= SAUVEGARDE/RESTAURATION AUTOMATIQUE AUTOUR DE LA MAINTENANCE =================
+# Déclenchées automatiquement par le bouton "Activer/Désactiver la
+# maintenance" du site web (voir site_web.py, page Sécurité), pour ne
+# jamais risquer de perdre l'état du bot pendant une intervention :
+# - à l'ACTIVATION : sauvegarde complète immédiate (fichiers + images +
+#   missions en cours), envoyée à la fois dans le salon Discord dédié ET
+#   synchronisée sur Google Drive, en plus d'être gardée en local dans
+#   SNAPSHOT_MAINTENANCE_FICHIER (nommé "valerius_*.json" pour être
+#   automatiquement repris par toutes les sauvegardes/synchros futures,
+#   sans rien à ajouter ailleurs).
+# - à la DÉSACTIVATION : retélécharge d'abord tout depuis Drive (au cas où
+#   le disque Render aurait été effacé pendant la maintenance), PUIS
+#   réinjecte cet instantané pour restaurer exactement l'état d'avant
+#   maintenance, missions en cours comprises.
+SNAPSHOT_MAINTENANCE_FICHIER = "valerius_snapshot_avant_maintenance.json"
+
+
+async def sauvegarder_totale_maintenance():
+    """Sauvegarde complète déclenchée à l'activation de la maintenance
+    depuis le site (fichier local + Discord + Drive). Ne lève jamais
+    d'exception : renvoie un dict de statut affichable directement sur le
+    site (voir /admin/securite)."""
+    resultat = {"fichier_local": False, "discord": False, "drive": 0}
+
+    try:
+        buffer, nom_fichier, taille = generer_backup_complet()
+        contenu = buffer.getvalue()
+        with open(SNAPSHOT_MAINTENANCE_FICHIER, "wb") as f:
+            f.write(contenu)
+        resultat["fichier_local"] = True
+    except Exception as e:
+        resultat["erreur_fichier"] = str(e)
+        return resultat
+
+    try:
+        salon = bot.get_channel(SALON_BACKUP_AUTO_ID)
+        if salon is None:
+            try:
+                salon = await bot.fetch_channel(SALON_BACKUP_AUTO_ID)
+            except Exception:
+                salon = None
+        if salon is None:
+            resultat["erreur_discord"] = f"Salon {SALON_BACKUP_AUTO_ID} introuvable."
+        elif taille > TAILLE_MAX_DISCORD:
+            resultat["erreur_discord"] = f"Fichier trop volumineux pour Discord ({taille / (1024 * 1024):.2f} Mo)."
+        else:
+            await salon.send(
+                content=f"🛠️ **Sauvegarde automatique avant maintenance** — {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                file=discord.File(io.BytesIO(contenu), filename=nom_fichier),
+            )
+            resultat["discord"] = True
+    except Exception as e:
+        resultat["erreur_discord"] = str(e)
+
+    try:
+        resultat["drive"] = await asyncio.to_thread(synchroniser_vers_drive)
+    except Exception as e:
+        resultat["erreur_drive"] = str(e)
+
+    return resultat
+
+
+async def restaurer_apres_maintenance():
+    """Réimportation complète déclenchée à la désactivation de la
+    maintenance depuis le site : retélécharge d'abord tout depuis Drive,
+    puis réapplique l'instantané pris à l'activation (missions en cours
+    comprises). Ne lève jamais d'exception : renvoie un dict de statut
+    affichable directement sur le site."""
+    resultat = {"drive_restaures": 0, "snapshot_applique": False}
+
+    try:
+        resultat["drive_restaures"] = await asyncio.to_thread(restaurer_tout_depuis_drive)
+    except Exception as e:
+        resultat["erreur_drive"] = str(e)
+
+    try:
+        if os.path.exists(SNAPSHOT_MAINTENANCE_FICHIER):
+            with open(SNAPSHOT_MAINTENANCE_FICHIER, "r", encoding="utf-8") as f:
+                donnees = json.load(f)
+            nb_restaurees, nb_fichiers = restaurer_donnees_backup(donnees)
+            resultat["snapshot_applique"] = True
+            resultat["missions_restaurees"] = nb_restaurees
+            resultat["fichiers_restaures"] = nb_fichiers
+        else:
+            resultat["erreur_snapshot"] = (
+                "Aucun instantané local retrouvé (ni sur le disque, ni sur Drive) : "
+                "rien à réimporter, l'état actuel n'a pas été modifié."
+            )
+    except Exception as e:
+        resultat["erreur_snapshot"] = str(e)
+
+    # Le snapshot et/ou Drive peuvent contenir une VIEILLE version de
+    # valerius_maintenance.json (actif=True, capturée au moment de
+    # l'ACTIVATION de la maintenance, puisque ce fichier correspond au
+    # motif générique "valerius_*.json" utilisé pour les sauvegardes). On
+    # force donc explicitement l'état "désactivé" ici, en dernier, pour
+    # garantir qu'aucune restauration ne puisse réactiver la maintenance
+    # malgré le clic de désactivation depuis le site.
+    definir_maintenance(False)
+
+    return resultat
 
 @bot.tree.command(name="total_restore", description="[Propriétaire] Restaure TOUTES les données du bot (tous serveurs) à partir d'un fichier de backup.")
 @app_commands.describe(fichier="Le fichier .json de sauvegarde totale")
@@ -2533,7 +4714,7 @@ async def historique(interaction: discord.Interaction, joueur: discord.Member = 
     embed = discord.Embed(title=f"📜 {cible.display_name}", description="**ARCHIVES ET PARCHEMIN**", color=discord.Color.blue())
     embed.set_thumbnail(url=cible.display_avatar.url)
     embed.set_footer(text=f"ID Discord : {cible.id}")
-    embed.add_field(name="📊 Bilan des Objectifs", value=f"🟢 **RÉUSSIES :** `{userData['total_reussies']}`\n🔴 **ÉCHOUÉES :** `{userData['total_echouees']}`", inline=False)
+    embed.add_field(name="📊 Bilan des Objectifs", value=f"🟢 **RÉUSSIES :** `{userData['total_reussies']}`\n🔴 **ÉCHOUÉES :** `{userData['total_echouees']}`\n🏅 **POINTS :** `{userData.get('total_points', 0)}`", inline=False)
     
     if not hist:
         embed.add_field(name="📜 Historique des Décrets", value="*Aucune mission enregistrée dans le grand registre.*", inline=False)
@@ -2571,15 +4752,19 @@ async def ajouterhistorique(interaction: discord.Interaction, joueur: discord.Me
     profils = charger_profils(g_id)
     initialiser_profil(joueur.id, profils)
 
+    points_gagnes = 0
     if statut == "Succès":
         profils[str(joueur.id)]["total_reussies"] += 1
+        points_gagnes = points_pour_categorie(g_id, categorie)
+        profils[str(joueur.id)]["total_points"] += points_gagnes
     else:
         profils[str(joueur.id)]["total_echouees"] += 1
 
-    ajouter_historique(joueur.id, profils, texte, statut, categorie)
+    ajouter_historique(joueur.id, profils, texte, statut, categorie, points=points_gagnes)
     sauvegarder_profils(g_id, profils)
 
-    await interaction.response.send_message(f"✅ Ajouté avec succès dans l'historique de {joueur.mention} !\nStatut : **{statut}** | Catégorie : **{categorie.upper()}** — *{texte}*", ephemeral=True)
+    texte_points = f"\n🏅 +{points_gagnes} points" if statut == "Succès" else ""
+    await interaction.response.send_message(f"✅ Ajouté avec succès dans l'historique de {joueur.mention} !\nStatut : **{statut}** | Catégorie : **{categorie.upper()}** — *{texte}*{texte_points}", ephemeral=True)
 
 @bot.tree.command(name="retirerhistorique", description="Retire une entrée de l'historique d'un joueur et ajuste ses compteurs.")
 @app_commands.describe(joueur="Le citoyen ciblé", position="Position dans l'historique (1 = la plus récente)")
@@ -2601,6 +4786,7 @@ async def retirerhistorique(interaction: discord.Interaction, joueur: discord.Me
     entree = hist.pop(index)
     if entree.get("statut") == "Succès":
         profils[str(joueur.id)]["total_reussies"] = max(0, profils[str(joueur.id)]["total_reussies"] - 1)
+        profils[str(joueur.id)]["total_points"] = max(0, profils[str(joueur.id)].get("total_points", 0) - entree.get("points", 0))
     else:
         profils[str(joueur.id)]["total_echouees"] = max(0, profils[str(joueur.id)]["total_echouees"] - 1)
     sauvegarder_profils(g_id, profils)
@@ -2723,7 +4909,7 @@ async def tutoadm(interaction: discord.Interaction):
     )
     embed_tuto.add_field(
         name="🛠️ 2. Commandes d'Urgence Manuelles",
-        value="`/openticket @joueur` -> Ouvrir un ticket\n`/fermerticket` -> Fermer instantanément un salon de ticket\n`/attribuer_mission` -> Assigner une mission auto\n`/ajouterhistorique @joueur [Succes/Echec] [categorie] [texte]` -> Ajouter une mission à l'historique\n`/export_actives` & `/import_actives` -> Sauvegarder/Recharger les missions en cours (ce serveur)\n`/missionaccepter` / `/missionrefuser` / `/missionpreuve`",
+        value="`/openticket @joueur` -> Ouvrir un ticket\n`/fermerticket` -> Fermer instantanément un salon de ticket\n`/attribuer_mission` -> Assigner une mission auto\n`/ajouterhistorique @joueur [Succes/Echec] [categorie] [texte]` -> Ajouter une mission à l'historique\n`/export_actives` & `/import_actives` -> Sauvegarder/Recharger les missions en cours (ce serveur)\n`/missionaccepter` / `/missionrefuser` / `/missionpreuve`\n`/points_config [categorie] [points]` -> Définir combien de points rapporte une catégorie\n`/points_categories` -> Voir la config actuelle des points",
         inline=False
     )
     embed_tuto.add_field(
@@ -2832,9 +5018,38 @@ async def listemissions(interaction: discord.Interaction):
     for msg in messages[1:]:
         await interaction.followup.send(msg, ephemeral=True)
 
+@bot.tree.command(name="points_config", description="[Staff] Définit combien de points rapporte n'importe quelle mission d'une catégorie.")
+@app_commands.describe(categorie="commune, moyenne, difficile ou royal", points="Nombre de points que rapportera CHAQUE mission de cette catégorie")
+@app_commands.choices(categorie=[
+    app_commands.Choice(name="Commune", value="commune"),
+    app_commands.Choice(name="Moyenne", value="moyenne"),
+    app_commands.Choice(name="Difficile", value="difficile"),
+    app_commands.Choice(name="Royal", value="royal"),
+])
+async def points_config(interaction: discord.Interaction, categorie: app_commands.Choice[str], points: int):
+    if not verifier_permissions_staff(interaction.user):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+    if points < 0:
+        await interaction.response.send_message("❌ Le nombre de points ne peut pas être négatif.", ephemeral=True)
+        return
+    g_id = interaction.guild.id
+    config = charger_points_categories(g_id)
+    config[categorie.value] = points
+    sauvegarder_points_categories(g_id, config)
+    await interaction.response.send_message(f"✅ Toutes les missions **{categorie.name.upper()}** rapportent désormais **{points} points** sur ce serveur.", ephemeral=True)
+    await envoyer_log_proprietaire(bot, f"LOG ABSOLU - POINTS CONFIG : {interaction.user.name} a fixé les points de la catégorie {categorie.value} à {points} sur {interaction.guild.name}")
+
+@bot.tree.command(name="points_categories", description="Affiche combien de points rapporte chaque catégorie de mission sur ce serveur.")
+async def points_categories_cmd(interaction: discord.Interaction):
+    config = charger_points_categories(interaction.guild.id)
+    lignes = "\n".join(f"• **{cat.upper()}** : `{pts}` points" for cat, pts in config.items())
+    embed = discord.Embed(title="🏅 Points par catégorie de mission", description=lignes, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="addmission", description="Ajoute une nouvelle quête au catalogue global du serveur.")
-@app_commands.describe(categorie="commune, moyenne, difficile, royal", texte="Contenu de l'objectif", temps="Exemple: 2h, 3j, 45min")
-async def addmission(interaction: discord.Interaction, categorie: str, texte: str, temps: str):
+@app_commands.describe(categorie="commune, moyenne, difficile, royal", texte="Contenu de l'objectif", temps="Exemple: 2h, 3j, 45min", points="(Optionnel) Points spécifiques à CETTE mission, sinon ceux de sa catégorie")
+async def addmission(interaction: discord.Interaction, categorie: str, texte: str, temps: str, points: int = None):
     if not verifier_permissions_staff(interaction.user):
         await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
         return
@@ -2846,9 +5061,13 @@ async def addmission(interaction: discord.Interaction, categorie: str, texte: st
     else:
         await interaction.response.send_message("❌ Catégorie invalide.", ephemeral=True)
         return
-    
-    sauvegarder_mission_fichier(interaction.guild.id, cat, texte, temps)
-    await interaction.response.send_message(f"⚖️ **Mission ajoutée pour ce serveur !** (`{cat}` : *{texte}* pendant {temps})", ephemeral=True)
+    if points is not None and points < 0:
+        await interaction.response.send_message("❌ Le nombre de points ne peut pas être négatif.", ephemeral=True)
+        return
+
+    sauvegarder_mission_fichier(interaction.guild.id, cat, texte, temps, points=points)
+    texte_points = f" — 🏅 {points} pts (surcharge)" if points is not None else ""
+    await interaction.response.send_message(f"⚖️ **Mission ajoutée pour ce serveur !** (`{cat}` : *{texte}* pendant {temps}{texte_points})", ephemeral=True)
 
 @bot.tree.command(name="delmission", description="Supprime une mission existante du fichier de configuration.")
 @app_commands.describe(categorie="commune, moyenne, difficile, royal", numero="Le numéro affiché sur le /listemissions")
@@ -2877,7 +5096,11 @@ async def delmission(interaction: discord.Interaction, categorie: str, numero: i
 @app_commands.describe(question="Ta question pour l'IA")
 async def ia(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
-    texte, erreur = await interroger_ia(_cle_ia(interaction), question)
+    texte, erreur = await interroger_ia(
+        _cle_ia(interaction), question,
+        guild_id=interaction.guild.id if interaction.guild else None,
+        joueur_id=interaction.user.id,
+    )
     if erreur:
         await interaction.followup.send(erreur, ephemeral=True)
         return
@@ -2897,6 +5120,111 @@ async def ia(interaction: discord.Interaction, question: str):
 async def ia_reset(interaction: discord.Interaction):
     reinitialiser_historique_ia(interaction)
     await interaction.response.send_message("🧹 Mémoire de l'Intelligence Royale réinitialisée pour ce salon.", ephemeral=True)
+
+# ================= API NATIONSGLORY (commandes publiques) =================
+NOMS_COMPETENCES = {
+    "miner": "⛏️ Mineur",
+    "lumberjack": "🪓 Bûcheron",
+    "farmer": "🌾 Fermier",
+    "builder": "🔨 Bâtisseur",
+    "hunter": "🏹 Chasseur",
+    "engineer": "⚙️ Ingénieur",
+}
+
+@bot.tree.command(name="profil_ng", description="Affiche le profil NationsGlory d'un joueur (par défaut sur le serveur Mocha).")
+@app_commands.describe(pseudo="Pseudo exact du joueur NationsGlory", serveur="Serveur NationsGlory (défaut : mocha)")
+async def profil_ng(interaction: discord.Interaction, pseudo: str, serveur: str = "mocha"):
+    await interaction.response.defer(thinking=True)
+    donnees, erreur = _requete_nationsglory(f"/user/{pseudo}")
+    if erreur:
+        await interaction.followup.send(f"❌ {erreur}", ephemeral=True)
+        return
+
+    serveur = (serveur or "mocha").strip().lower()
+    infos = (donnees.get("servers") or {}).get(serveur)
+    skin = donnees.get("skin") or {}
+
+    embed = discord.Embed(
+        title=f"🎮 Profil NationsGlory — {donnees.get('username', pseudo)}",
+        color=discord.Color.gold(),
+    )
+    if skin.get("head"):
+        embed.set_thumbnail(url=skin["head"])
+    embed.add_field(name="📅 Compte créé le", value=donnees.get("created_at") or "Inconnu", inline=True)
+    embed.add_field(name="🕐 Dernière connexion (globale)", value=donnees.get("last_connection") or "Inconnue", inline=True)
+
+    if not infos:
+        embed.add_field(name="⚠️ Serveur", value=f"Aucune donnée pour ce joueur sur « {serveur} ».", inline=False)
+    else:
+        statut = "🟢 En ligne" if infos.get("online") else "🔴 Hors ligne"
+        pays = infos.get("country") or "Sans pays"
+        rang = infos.get("country_rank") or "—"
+        power = infos.get("power")
+        max_power = infos.get("max_power")
+        temps_jeu = _formater_duree_secondes(infos.get("playtime")) or "Inconnu"
+
+        embed.add_field(name=f"🌍 Serveur {serveur.capitalize()}", value=statut, inline=True)
+        embed.add_field(name="🏳️ Pays", value=pays, inline=True)
+        embed.add_field(name="🎖️ Rang", value=rang, inline=True)
+        embed.add_field(name="💪 Power", value=f"{power}/{max_power}" if power is not None else "—", inline=True)
+        embed.add_field(name="⏱️ Temps de jeu", value=temps_jeu, inline=True)
+        embed.add_field(name="🕐 Dernière connexion (serveur)", value=infos.get("last_connection") or "Inconnue", inline=True)
+
+        competences = infos.get("skills")
+        if isinstance(competences, dict):
+            lignes = [f"{NOMS_COMPETENCES.get(cle, cle.capitalize())} : **{valeur}**" for cle, valeur in competences.items()]
+            embed.add_field(name="🛠️ Compétences", value="\n".join(lignes), inline=False)
+        else:
+            embed.add_field(name="🛠️ Compétences", value="Non disponibles sur ce serveur.", inline=False)
+
+    embed.set_footer(text="Données officielles NationsGlory")
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="pays_ng", description="Affiche les informations d'un pays NationsGlory (par défaut sur le serveur Mocha).")
+@app_commands.describe(pays="Nom exact du pays NationsGlory", serveur="Serveur NationsGlory (défaut : mocha)")
+async def pays_ng(interaction: discord.Interaction, pays: str, serveur: str = "mocha"):
+    await interaction.response.defer(thinking=True)
+    serveur = (serveur or "mocha").strip().lower()
+    donnees, erreur = _requete_nationsglory(f"/country/{serveur}/{pays}")
+    if erreur:
+        await interaction.followup.send(f"❌ {erreur}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🏰 {donnees.get('name', pays)}",
+        description=donnees.get("description") or None,
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(name="🌍 Serveur", value=(donnees.get("server") or serveur).capitalize(), inline=True)
+    embed.add_field(name="👑 Chef", value=donnees.get("leader") or "Inconnu", inline=True)
+    embed.add_field(name="📅 Créé le", value=donnees.get("creation_date") or "Inconnue", inline=True)
+    embed.add_field(name="👥 Membres", value=str(donnees.get("count_members", 0)), inline=True)
+    power = donnees.get("power")
+    power_max = donnees.get("maxpower")
+    embed.add_field(name="💪 Power", value=f"{power}/{power_max}" if power is not None else "—", inline=True)
+    embed.add_field(name="📊 MMR / Niveau", value=f"{donnees.get('mmr', '—')} / {donnees.get('level', '—')}", inline=True)
+
+    allies = donnees.get("allies") or []
+    ennemis = donnees.get("ennemies") or []
+    embed.add_field(name="🤝 Alliés", value=", ".join(allies) if allies else "Aucun", inline=False)
+    embed.add_field(name="⚔️ Ennemis", value=", ".join(ennemis) if ennemis else "Aucun", inline=False)
+
+    fichier_drapeau = None
+    drapeau_b64 = donnees.get("flag")
+    if drapeau_b64:
+        try:
+            import base64
+            octets_drapeau = base64.b64decode(drapeau_b64)
+            fichier_drapeau = discord.File(io.BytesIO(octets_drapeau), filename="drapeau.png")
+            embed.set_thumbnail(url="attachment://drapeau.png")
+        except Exception:
+            fichier_drapeau = None
+
+    embed.set_footer(text="Données officielles NationsGlory")
+    if fichier_drapeau:
+        await interaction.followup.send(embed=embed, file=fichier_drapeau)
+    else:
+        await interaction.followup.send(embed=embed)
 
 # ================= RANKUP / DÉRANK — "OSIRIS" (commandes) =================
 @bot_osiris.tree.command(name="rankup", description="Décret Royal : promeut un joueur à un nouveau rang et publie l'annonce officielle.")
@@ -2925,12 +5253,7 @@ async def rankup(interaction: discord.Interaction, joueur: discord.Member, nouve
             erreurs.append(f"Impossible de retirer le rôle **{ancien_rang.name}** : {e}")
 
     salon_cible = salon or interaction.channel
-    message_decret = (
-        "◈═══════◈ ◈═══════◈ **Décret Royal** ◈═══════◈ ◈═══════◈\n\n"
-        f"Pour son engagement, sa loyauté et ses services envers le Royaume, {joueur.mention} est officiellement promu au rang de {nouveau_rang.mention}.\n\n"
-        f"Que cette promotion soit portée avec honneur et marque le début de nouvelles responsabilités. Félicitations à {joueur.mention} ! 🇲🇬\n\n"
-        "*Hasina ho an'ny Fanjakana! Gloire au Royaume.*"
-    )
+    message_decret = _texte_decret_royal(joueur.mention, f"{nouveau_rang.mention}")
     try:
         await salon_cible.send(message_decret)
     except Exception as e:
@@ -2983,6 +5306,22 @@ async def derank(interaction: discord.Interaction, joueur: discord.Member, ancie
         await salon_cible.send(message_decret)
     except Exception as e:
         erreurs.append(f"Impossible d'envoyer le décret dans {salon_cible.mention} : {e}")
+
+    # MP personnel au joueur rétrogradé (envoyé une seule fois : la commande
+    # /derank n'est déclenchée qu'une fois par le staff pour cet événement,
+    # contrairement au rappel d'éligibilité au rankup qui, lui, tourne en
+    # boucle et se protège via le drapeau 'eligibilite_notifiee').
+    texte_mp = (
+        f"⬇️ Tu as été rétrogradé du rang de **{ancien_rang.name}**"
+        + (f" vers **{nouveau_rang.name}**" if nouveau_rang else "")
+        + "."
+        + (f"\n**Motif :** {raison}" if raison else "")
+    )
+    try:
+        await joueur.send(f"⬇️ **Osiris — Décret de Rétrogradation**\n{texte_mp}")
+    except Exception as e:
+        erreurs.append(f"Impossible d'envoyer le MP à {joueur.mention} (MP fermés ?) : {e}")
+    ajouter_notification(interaction.guild.id, joueur.id, texte_mp, categorie="rankup")
 
     ajouter_rankup(interaction.guild.id, joueur.id, "retrogradation", ancien_rang.name, nouveau_rang.name if nouveau_rang else None, interaction.user.id, raison)
     await envoyer_log_proprietaire(bot_osiris, f"[{interaction.guild.name}] ⬇️ Dérank : {joueur} rétrogradé de {ancien_rang.name} par {interaction.user}" + (f" ({raison})" if raison else "") + ".")
@@ -3086,6 +5425,191 @@ async def retirerblam(interaction: discord.Interaction, joueur: discord.Member, 
     else:
         await interaction.response.send_message("❌ Blâme introuvable pour ce joueur (vérifie le numéro avec /blames).", ephemeral=True)
 
+# ================= COMMANDES DE SIRIUS (SYSTÈME DES RANGS) =================
+
+async def _autocomplete_rangs(interaction: discord.Interaction, valeur_actuelle: str):
+    if not interaction.guild:
+        return []
+    rangs = charger_rangs(interaction.guild.id)
+    valeur_actuelle = (valeur_actuelle or "").lower()
+    return [
+        app_commands.Choice(name=f"{r['icone']} {r['nom']} ({r['groupe']})", value=r["id"])
+        for r in sorted(rangs, key=lambda r: r["ordre"])
+        if valeur_actuelle in r["nom"].lower()
+    ][:25]
+
+async def _autocomplete_demandes_en_attente(interaction: discord.Interaction, valeur_actuelle: str):
+    if not interaction.guild:
+        return []
+    demandes = obtenir_demandes_rang(interaction.guild.id, statut="en_attente")
+    valeur_actuelle = (valeur_actuelle or "").lower()
+    choix = []
+    for d in demandes:
+        rang = obtenir_rang_par_id(interaction.guild.id, d["rang_id"])
+        membre = interaction.guild.get_member(int(d["joueur_id"]))
+        nom_joueur = membre.display_name if membre else d["joueur_id"]
+        libelle = f"{nom_joueur} → {rang['nom'] if rang else d['rang_id']} ({d['date']})"
+        if valeur_actuelle in libelle.lower():
+            choix.append(app_commands.Choice(name=libelle[:100], value=d["id"]))
+    return choix[:25]
+
+@bot_rangs.tree.command(name="rangs", description="Affiche le catalogue complet des rangs du royaume.")
+async def rangs_catalogue(interaction: discord.Interaction):
+    rangs = sorted(charger_rangs(interaction.guild.id), key=lambda r: r["ordre"])
+    embed = discord.Embed(title="🎖️ Catalogue des rangs — Sirius", color=discord.Color.gold())
+    for groupe in GROUPES_RANGS:
+        rangs_groupe = [r for r in rangs if r["groupe"] == groupe]
+        if not rangs_groupe:
+            continue
+        lignes = []
+        for r in rangs_groupe:
+            lignes.append(f"{r['icone']} **{r['nom']}**" + (" 👑 *(unique)*" if r.get("unique") else ""))
+        embed.add_field(name=f"— {groupe} —", value="\n".join(lignes), inline=False)
+    embed.set_footer(text="Utilise /monrang pour voir ta progression, ou /demanderrang pour postuler.")
+    await interaction.response.send_message(embed=embed)
+
+@bot_rangs.tree.command(name="monrang", description="Affiche ton rang actuel et ta progression vers le suivant.")
+async def monrang(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    rang_actuel = obtenir_rang_joueur(guild_id, interaction.user.id)
+    rangs = sorted(charger_rangs(guild_id), key=lambda r: r["ordre"])
+    embed = discord.Embed(title=f"🎖️ Progression de {interaction.user.display_name}", color=discord.Color.gold())
+    if not rang_actuel:
+        embed.description = "Aucun catalogue de rangs n'est configuré sur ce serveur."
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    embed.add_field(name="Rang actuel", value=f"{rang_actuel['icone']} **{rang_actuel['nom']}**", inline=False)
+
+    rang_suivant = next((r for r in rangs if r["ordre"] > rang_actuel["ordre"]), None)
+    if rang_suivant:
+        rapport = verifier_conditions_rang(interaction.guild, interaction.user.id, rang_suivant)
+        lignes = []
+        for c in rapport["auto"]:
+            lignes.append(f"{'✅' if c['ok'] else '❌'} {c['libelle']} *(actuel : {c['valeur_actuelle']})*")
+        for c in rapport["manuel"]:
+            lignes.append(f"🔎 {c['libelle']} *(vérifié manuellement par un instructeur)*")
+        embed.add_field(
+            name=f"Prochain rang : {rang_suivant['icone']} {rang_suivant['nom']}",
+            value="\n".join(lignes) if lignes else "Aucune condition particulière.",
+            inline=False
+        )
+        embed.set_footer(text="Utilise /demanderrang une fois prêt pour postuler.")
+    else:
+        embed.add_field(name="Prochain rang", value="Tu as atteint le sommet de la hiérarchie ! 👑", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot_rangs.tree.command(name="demanderrang", description="Soumets une demande de promotion vers un rang du catalogue.")
+@app_commands.describe(rang="Le rang visé", motivation="Explique pourquoi tu mérites ce rang")
+@app_commands.autocomplete(rang=_autocomplete_rangs)
+async def demanderrang(interaction: discord.Interaction, rang: str, motivation: str):
+    guild_id = interaction.guild.id
+    cible = obtenir_rang_par_id(guild_id, rang)
+    if not cible:
+        return await interaction.response.send_message("❌ Rang inconnu (choisis-le dans la liste proposée).", ephemeral=True)
+
+    demandes_en_cours = obtenir_demandes_rang(guild_id, statut="en_attente", joueur_id=interaction.user.id)
+    if demandes_en_cours:
+        return await interaction.response.send_message(
+            "⚠️ Tu as déjà une demande de rang en attente de traitement. Merci de patienter.", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    demande = creer_demande_rang(guild_id, interaction.user.id, rang, motivation)
+    if not demande:
+        return await interaction.followup.send("❌ Impossible de créer la demande (rang introuvable).", ephemeral=True)
+
+    await interaction.followup.send(
+        f"📥 Ta demande pour devenir **{cible['nom']}** a bien été transmise aux instructeurs !", ephemeral=True
+    )
+    await envoyer_log_proprietaire(
+        bot_rangs, f"[{interaction.guild.name}] 📥 Nouvelle demande de rang : {interaction.user} → {cible['nom']}."
+    )
+
+@bot_rangs.tree.command(name="mesdemandes", description="Affiche l'historique de tes demandes de rang.")
+async def mesdemandes(interaction: discord.Interaction):
+    demandes = obtenir_demandes_rang(interaction.guild.id, joueur_id=interaction.user.id)
+    if not demandes:
+        return await interaction.response.send_message("Tu n'as encore soumis aucune demande de rang.", ephemeral=True)
+    embed = discord.Embed(title="📋 Tes demandes de rang", color=discord.Color.gold())
+    icones_statut = {"en_attente": "⏳", "accepte": "✅", "refuse": "❌"}
+    for d in demandes[:10]:
+        rang = obtenir_rang_par_id(interaction.guild.id, d["rang_id"])
+        embed.add_field(
+            name=f"{icones_statut.get(d['statut'], '•')} {rang['nom'] if rang else d['rang_id']} — {d['date']}",
+            value=f"Statut : **{d['statut']}**" + (f"\n> {d['commentaire']}" if d.get("commentaire") else ""),
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot_rangs.tree.command(name="demandesrang", description="[Staff] Liste les demandes de rang en attente de traitement.")
+async def demandesrang(interaction: discord.Interaction):
+    if not verifier_permissions_staff(interaction.user):
+        return await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    demandes = obtenir_demandes_rang(interaction.guild.id, statut="en_attente")
+    if not demandes:
+        return await interaction.response.send_message("✅ Aucune demande de rang en attente.", ephemeral=True)
+    embed = discord.Embed(title="📥 Demandes de rang en attente", color=discord.Color.gold())
+    for d in demandes[:20]:
+        rang = obtenir_rang_par_id(interaction.guild.id, d["rang_id"])
+        membre = interaction.guild.get_member(int(d["joueur_id"]))
+        auto_ok = "✅" if d.get("rapport_auto", {}).get("toutes_auto_ok") else "⚠️"
+        embed.add_field(
+            name=f"{membre.display_name if membre else d['joueur_id']} → {rang['nom'] if rang else d['rang_id']} {auto_ok}",
+            value=f"*{(d.get('motivation') or '—')[:200]}*\n📅 {d['date']}",
+            inline=False
+        )
+    embed.set_footer(text="Utilise /validerrang ou /refuserrang pour traiter une demande.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot_rangs.tree.command(name="validerrang", description="[Staff] Accepte une demande de rang en attente.")
+@app_commands.describe(demande="La demande à valider", commentaire="Commentaire optionnel",
+                        forcer="Promouvoir quand même si les conditions automatiques ne sont pas remplies (défaut: non)")
+@app_commands.autocomplete(demande=_autocomplete_demandes_en_attente)
+async def validerrang(interaction: discord.Interaction, demande: str, commentaire: str = None, forcer: bool = False):
+    if not verifier_permissions_staff(interaction.user):
+        return await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    resultat = traiter_demande_rang(interaction.guild.id, demande, "accepte", interaction.user.id, commentaire, forcer=forcer)
+    if resultat == "conditions_non_remplies":
+        demande_obj = obtenir_demande_rang_par_id(interaction.guild.id, demande)
+        rapport = demande_obj.get("rapport_auto", {}) if demande_obj else {}
+        lignes = [f"{'✅' if c.get('ok') else '❌'} {c['libelle']} (constaté : {c.get('valeur_actuelle')})"
+                  for c in rapport.get("auto", [])]
+        detail = "\n".join(lignes) if lignes else "—"
+        return await interaction.followup.send(
+            "⚠️ Ce joueur ne remplit pas encore toutes les conditions automatiques de ce rang, "
+            "la promotion a été **bloquée** :\n" + detail +
+            "\n\nSi tu veux quand même le promouvoir, relance la commande avec `forcer: Vrai`.",
+            ephemeral=True
+        )
+    if not resultat:
+        return await interaction.followup.send("❌ Demande introuvable ou déjà traitée.", ephemeral=True)
+    rang = obtenir_rang_par_id(interaction.guild.id, resultat["rang_id"])
+    await interaction.followup.send(f"🎖️ Demande acceptée : <@{resultat['joueur_id']}> devient **{rang['nom']}** !", ephemeral=True)
+    suffixe_force = " (⚠️ forcée malgré des conditions automatiques non remplies)" if forcer else ""
+    await envoyer_log_proprietaire(
+        bot_rangs, f"[{interaction.guild.name}] 🎖️ Demande de rang acceptée pour <@{resultat['joueur_id']}> ({rang['nom']}) par {interaction.user}."
+        + suffixe_force
+    )
+
+@bot_rangs.tree.command(name="refuserrang", description="[Staff] Refuse une demande de rang en attente.")
+@app_commands.describe(demande="La demande à refuser", commentaire="Motif du refus (optionnel)")
+@app_commands.autocomplete(demande=_autocomplete_demandes_en_attente)
+async def refuserrang(interaction: discord.Interaction, demande: str, commentaire: str = None):
+    if not verifier_permissions_staff(interaction.user):
+        return await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    resultat = traiter_demande_rang(interaction.guild.id, demande, "refuse", interaction.user.id, commentaire)
+    if not resultat:
+        return await interaction.followup.send("❌ Demande introuvable ou déjà traitée.", ephemeral=True)
+    rang = obtenir_rang_par_id(interaction.guild.id, resultat["rang_id"])
+    await interaction.followup.send(f"📋 Demande refusée : <@{resultat['joueur_id']}> pour {rang['nom']}.", ephemeral=True)
+    await envoyer_log_proprietaire(
+        bot_rangs, f"[{interaction.guild.name}] 📋 Demande de rang refusée pour <@{resultat['joueur_id']}> ({rang['nom']}) par {interaction.user}."
+    )
+
+# ================= FIN COMMANDES DE SIRIUS =================
+
 # ================= SITE WEB D'ADMINISTRATION =================
 # Même app Flask que keep_alive() : un seul process, un seul serveur Render.
 site_web.configurer_site(app, bot, {
@@ -3097,10 +5621,16 @@ site_web.configurer_site(app, bot, {
     "sauvegarder_profils": sauvegarder_profils,
     "initialiser_profil": initialiser_profil,
     "ajouter_historique": ajouter_historique,
+    "charger_points_categories": charger_points_categories,
+    "sauvegarder_points_categories": sauvegarder_points_categories,
+    "points_pour_categorie": points_pour_categorie,
+    "definir_points_mission": definir_points_mission,
     "missions_actives": missions_actives,
     "verrou_missions": verrou_missions,
     "generer_backup_complet": generer_backup_complet,
     "restaurer_donnees_backup": restaurer_donnees_backup,
+    "sauvegarder_totale_maintenance": sauvegarder_totale_maintenance,
+    "restaurer_apres_maintenance": restaurer_apres_maintenance,
     "charger_logs_recents": charger_logs_recents,
     "sauvegarder_log_disque": sauvegarder_log_disque,
     "bot_start_time": BOT_START_TIME,
@@ -3113,6 +5643,7 @@ site_web.configurer_site(app, bot, {
     "extraire_duree": extraire_duree,
     "action_accepter_mission": action_accepter_mission,
     "action_refuser_mission": action_refuser_mission,
+    "attribuer_mission_precise_site": attribuer_mission_precise_site,
     "envoyer_double_notification": envoyer_double_notification,
     "formater_duree": formater_duree,
     "obtenir_blames_actifs": obtenir_blames_actifs,
@@ -3123,30 +5654,83 @@ site_web.configurer_site(app, bot, {
     "seuil_proces_blame": SEUIL_PROCES_BLAME,
     "interroger_ia": interroger_ia,
     "reinitialiser_historique_ia_cle": reinitialiser_historique_ia_cle,
+    "ajouter_notification": ajouter_notification,
+    "obtenir_notifications": obtenir_notifications,
+    "compter_notifications_non_lues": compter_notifications_non_lues,
+    "marquer_notifications_lues": marquer_notifications_lues,
+    "obtenir_notifications_multi": obtenir_notifications_multi,
+    "compter_notifications_non_lues_multi": compter_notifications_non_lues_multi,
+    "marquer_notifications_lues_multi": marquer_notifications_lues_multi,
+    "charger_rangs": charger_rangs,
+    "sauvegarder_rangs": sauvegarder_rangs,
+    "obtenir_rang_par_id": obtenir_rang_par_id,
+    "obtenir_rang_joueur": obtenir_rang_joueur,
+    "verifier_conditions_rang": verifier_conditions_rang,
+    "creer_demande_rang": creer_demande_rang,
+    "obtenir_demandes_rang": obtenir_demandes_rang,
+    "obtenir_demande_rang_par_id": obtenir_demande_rang_par_id,
+    "traiter_demande_rang": traiter_demande_rang,
+    "groupes_rangs": GROUPES_RANGS,
+    "charger_boutique": charger_boutique,
+    "obtenir_produit_boutique": obtenir_produit_boutique,
+    "ajouter_produit_boutique": ajouter_produit_boutique,
+    "modifier_produit_boutique": modifier_produit_boutique,
+    "supprimer_produit_boutique": supprimer_produit_boutique,
+    "acheter_produit_boutique": acheter_produit_boutique,
+    "charger_roue": charger_roue,
+    "obtenir_part_roue": obtenir_part_roue,
+    "ajouter_part_roue": ajouter_part_roue,
+    "modifier_part_roue": modifier_part_roue,
+    "basculer_actif_part_roue": basculer_actif_part_roue,
+    "supprimer_part_roue": supprimer_part_roue,
+    "tourner_roue": tourner_roue,
+    "jouer_roue": jouer_roue,
+    "types_roue": TYPES_ROUE,
+    "noms_types_roue": NOMS_TYPES_ROUE,
+    "obtenir_tickets_roue": obtenir_tickets_roue,
+    "ajouter_tickets_roue": ajouter_tickets_roue,
+    "retirer_ticket_roue": retirer_ticket_roue,
 })
+
+print("[Démarrage] Vérification de la synchronisation Google Drive...")
+restaurer_tout_depuis_drive()
 
 keep_alive()
 
 async def main():
     token_valerius = os.environ.get("DIS_TOKEN") or os.environ.get("DISCORD_TOKEN")
-    # Variable Render existante côté utilisateur : "osiris_id"
+    # Variables Render existantes côté utilisateur : "osiris_id" et "sirius_id"
+    # (fallback sur "ascalon_id" pour ne pas casser le déploiement tant que
+    # la variable Render n'a pas été renommée après le passage Ascalon → Sirius).
     token_osiris = os.environ.get("osiris_id") or os.environ.get("OSIRIS_TOKEN") or os.environ.get("OSIRIS_ID")
+    token_rangs = (
+        os.environ.get("sirius_id") or os.environ.get("SIRIUS_TOKEN") or os.environ.get("SIRIUS_ID")
+        or os.environ.get("ascalon_id") or os.environ.get("ASCALON_TOKEN") or os.environ.get("ASCALON_ID")
+    )
 
     if not token_valerius:
         print("Erreur : Aucun token Discord trouvé pour Valerius (DIS_TOKEN / DISCORD_TOKEN).")
         return
 
-    if not token_osiris:
-        print("⚠️ Aucun token trouvé pour Osiris (variable 'osiris_id') — seul Valerius va démarrer.")
+    bots_a_lancer = [("Valerius", bot, token_valerius)]
+    if token_osiris:
+        bots_a_lancer.append(("Osiris", bot_osiris, token_osiris))
+    else:
+        print("⚠️ Aucun token trouvé pour Osiris (variable 'osiris_id') — il ne démarrera pas.")
+    if token_rangs:
+        bots_a_lancer.append(("Sirius", bot_rangs, token_rangs))
+    else:
+        print("⚠️ Aucun token trouvé pour Sirius (variable 'sirius_id') — il ne démarrera pas.")
+
+    if len(bots_a_lancer) == 1:
         async with bot:
             await bot.start(token_valerius)
         return
 
-    async with bot, bot_osiris:
-        await asyncio.gather(
-            bot.start(token_valerius),
-            bot_osiris.start(token_osiris),
-        )
+    async with contextlib.AsyncExitStack() as pile:
+        for _, b, _ in bots_a_lancer:
+            await pile.enter_async_context(b)
+        await asyncio.gather(*(b.start(t) for _, b, t in bots_a_lancer))
 
 try:
     asyncio.run(main())
